@@ -36,12 +36,21 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
     return makeRouteResponse(status: 200, body: "ok")
   }
 
-  let agentAddress = req.osaurus?.agent_address
-  logDebug("handleWebhook: email.received email_id=\(event.data.email_id)")
-
-  DispatchQueue.global(qos: .userInitiated).async {
-    processInboundEmail(ctx: ctx, eventData: event.data, agentAddress: agentAddress)
+  let emailId = event.data.email_id
+  if ctx.processedEmailIds.contains(emailId) {
+    logDebug("handleWebhook: skipping duplicate email_id=\(emailId)")
+    return makeRouteResponse(status: 200, body: "ok")
   }
+  ctx.processedEmailIds.insert(emailId)
+  if ctx.processedEmailIds.count > 500 {
+    let oldest = ctx.processedEmailIds.prefix(ctx.processedEmailIds.count - 400)
+    for id in oldest { ctx.processedEmailIds.remove(id) }
+  }
+
+  let agentAddress = req.osaurus?.agent_address
+  logDebug("handleWebhook: email.received email_id=\(emailId)")
+
+  processInboundEmail(ctx: ctx, eventData: event.data, agentAddress: agentAddress)
 
   return makeRouteResponse(status: 200, body: "ok")
 }
@@ -177,15 +186,21 @@ private func processInboundEmail(
 // MARK: - Authorization
 
 func isAuthorized(sender: String) -> Bool {
-  let policy = configGet("sender_policy") ?? "known"
+  let policyRaw = configGet("sender_policy")
+  let policy = policyRaw ?? "known"
+  logDebug("isAuthorized: sender=\(sender) sender_policy='\(policy)' (raw=\(policyRaw ?? "nil"))")
 
-  if policy == "open" {
+  if policy != "known" {
+    logDebug("isAuthorized: policy is not 'known', accepting all senders")
     return true
   }
 
   let senderLower = sender.lowercased()
 
-  if let allowedStr = configGet("allowed_senders"), !allowedStr.isEmpty {
+  let allowedStr = configGet("allowed_senders")
+  logDebug("isAuthorized: allowed_senders='\(allowedStr ?? "nil")'")
+
+  if let allowedStr, !allowedStr.isEmpty {
     let allowed = allowedStr.split(separator: ",").map {
       $0.trimmingCharacters(in: .whitespaces).lowercased()
     }

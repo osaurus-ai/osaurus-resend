@@ -6,6 +6,8 @@ final class PluginContext: @unchecked Sendable {
   var tunnelURL: String?
   var taskArtifacts: [String: [CollectedArtifact]] = [:]
   var taskDispatchTimestamps: [String: Int] = [:]
+  var processedEmailIds: Set<String> = []
+  private static let maxProcessedIds = 500
 
   let sendTool = ResendSendTool()
   let replyTool = ResendReplyTool()
@@ -36,7 +38,8 @@ func destroyPlugin(_ ctx: PluginContext) {
 func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
   logDebug("onConfigChanged: key=\(key) hasValue=\(value != nil)")
 
-  if key == "tunnel_url" {
+  switch key {
+  case "tunnel_url":
     guard let newURL = value, !newURL.isEmpty else {
       ctx.tunnelURL = nil
       return
@@ -47,35 +50,42 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
       return
     }
     setupWebhook(ctx: ctx, apiKey: apiKey, tunnelURL: newURL)
-    return
+
+  case "api_key":
+    let newKey = (value?.isEmpty == false) ? value : nil
+
+    if let oldWebhookId = configGet("webhook_id"), !oldWebhookId.isEmpty,
+      let oldKey = configGet("api_key"), !oldKey.isEmpty
+    {
+      _ = resendDeleteWebhook(apiKey: oldKey, webhookId: oldWebhookId)
+      configDelete("webhook_id")
+      configDelete("signing_secret")
+      configDelete("webhook_registered")
+      logInfo("Old webhook deleted")
+    }
+
+    guard let newKey else {
+      configDelete("webhook_registered")
+      logInfo("API key cleared")
+      return
+    }
+
+    guard let tunnelURL = ctx.tunnelURL, !tunnelURL.isEmpty else {
+      logDebug("onConfigChanged: api_key stored, waiting for tunnel_url")
+      return
+    }
+
+    setupWebhook(ctx: ctx, apiKey: newKey, tunnelURL: tunnelURL)
+
+  case "sender_policy":
+    logInfo("Sender policy changed to: \(value ?? "known")")
+
+  case "allowed_senders":
+    logInfo("Allowed senders updated: \(value ?? "(empty)")")
+
+  default:
+    break
   }
-
-  guard key == "api_key" else { return }
-
-  let newKey = (value?.isEmpty == false) ? value : nil
-
-  if let oldWebhookId = configGet("webhook_id"), !oldWebhookId.isEmpty,
-    let oldKey = configGet("api_key"), !oldKey.isEmpty
-  {
-    _ = resendDeleteWebhook(apiKey: oldKey, webhookId: oldWebhookId)
-    configDelete("webhook_id")
-    configDelete("signing_secret")
-    configDelete("webhook_registered")
-    logInfo("Old webhook deleted")
-  }
-
-  guard let newKey else {
-    configDelete("webhook_registered")
-    logInfo("API key cleared")
-    return
-  }
-
-  guard let tunnelURL = ctx.tunnelURL, !tunnelURL.isEmpty else {
-    logDebug("onConfigChanged: api_key stored, waiting for tunnel_url")
-    return
-  }
-
-  setupWebhook(ctx: ctx, apiKey: newKey, tunnelURL: tunnelURL)
 }
 
 // MARK: - Webhook Setup

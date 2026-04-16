@@ -146,7 +146,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
         "name": "Resend (Email)",
         "version": "0.1.0",
         "description": "Send, receive, and manage email through Resend",
-        "instructions": "You have access to email via the Resend plugin. This is asynchronous email communication, not instant messaging. Write complete, professional, self-contained responses — the recipient may not read your reply for hours or days. Every response should be thorough enough to stand on its own without requiring immediate follow-up.\n\nWhen you receive an inbound email, the thread_id is provided in the prompt. Use resend_reply with that thread_id to respond. The reply is sent to all thread participants by default (reply-all). If you need to reply only to a specific person, pass the 'to' parameter.\n\nTo compose a new email to someone not in the current thread, use resend_send. This creates a new thread and authorizes the recipient for future replies.\n\nTo review past conversations, use resend_list_threads (filterable by participant or label) for summaries, and resend_get_thread for full message bodies. Use resend_label_thread to tag threads for organization (e.g. 'scheduling', 'invoices', 'urgent').\n\nWhen producing files during a task, they are automatically attached to your next reply — you do not need to handle attachments manually.",
+        "instructions": "You have access to email via the Resend plugin. This is asynchronous email communication, not instant messaging. Write complete, professional, self-contained responses -- the recipient may not read your reply for hours or days. Every response should be thorough enough to stand on its own without requiring immediate follow-up.\\n\\nWhen you receive an inbound email, the thread_id is provided in the prompt. Use resend_reply with that thread_id to respond. The reply is sent to all thread participants by default (reply-all). If you need to reply only to a specific person, pass the to parameter.\\n\\nTo compose a new email to someone not in the current thread, use resend_send. This creates a new thread and authorizes the recipient for future replies.\\n\\nTo review past conversations, use resend_list_threads (filterable by participant or label) for summaries, and resend_get_thread for full message bodies. Use resend_label_thread to tag threads for organization (e.g. scheduling, invoices, urgent).\\n\\nWhen producing files during a task, they are automatically attached to your next reply. You do not need to handle attachments manually.",
         "license": "MIT",
         "authors": [],
         "min_macos": "15.0",
@@ -216,7 +216,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
             },
             {
               "id": "resend_label_thread",
-              "description": "Add or remove labels on a thread to organize conversations. Labels are freeform strings — use whatever makes sense for the context (e.g. 'scheduling', 'invoices', 'urgent', 'follow-up'). Threads can be filtered by label using resend_list_threads.",
+              "description": "Add or remove labels on a thread to organize conversations. Labels are freeform strings -- use whatever makes sense for the context (e.g. scheduling, invoices, urgent, follow-up). Threads can be filtered by label using resend_list_threads.",
               "parameters": {
                 "type": "object",
                 "properties": {
