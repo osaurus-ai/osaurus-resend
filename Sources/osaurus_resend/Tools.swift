@@ -26,8 +26,7 @@ struct ResendSendTool {
       return "{\"error\":\"from_email not configured\"}"
     }
 
-    let fromName = configGet("from_name") ?? ""
-    let from = fromName.isEmpty ? fromEmail : "\(fromName) <\(fromEmail)>"
+    let from = formatFromAddress(name: configGet("from_name"), email: fromEmail)
     let toList = [input.to]
     let ccList = input.cc.map { [$0] }
     let bccList = input.bcc.map { [$0] }
@@ -95,70 +94,25 @@ struct ResendReplyTool {
       return "{\"error\":\"Thread not found\"}"
     }
 
-    let fromName = configGet("from_name") ?? ""
-    let from = fromName.isEmpty ? fromEmail : "\(fromName) <\(fromEmail)>"
-    let fromLower = fromEmail.lowercased()
-
-    let toList: [String]
-    var ccList: [String] = []
-
-    if let explicitTo = input.to {
-      toList = [explicitTo]
-    } else {
-      let lastInbound = DatabaseManager.getLastInboundMessage(threadId: input.thread_id)
-      if let lastFrom = lastInbound?.fromAddress {
-        let replyTo = extractEmailAddress(lastFrom)
-        toList = [replyTo]
-        ccList = thread.participants.filter {
-          $0.lowercased() != fromLower && $0.lowercased() != replyTo.lowercased()
-        }
-      } else {
-        toList = thread.participants.filter { $0.lowercased() != fromLower }
-        if toList.isEmpty {
-          return "{\"error\":\"No recipients found in thread\"}"
-        }
-      }
+    guard
+      let recipients = computeReplyRecipients(
+        thread: thread, fromEmail: fromEmail, explicitTo: input.to)
+    else {
+      return "{\"error\":\"No recipients found in thread\"}"
     }
 
-    let subject =
-      thread.subject.map { sub in
-        sub.hasPrefix("Re:") ? sub : "Re: \(sub)"
-      } ?? "Re:"
-
-    var headers: [String: String] = [:]
-    if let lastMsgId = thread.lastMessageId {
-      headers["In-Reply-To"] = lastMsgId
-    }
-    if let refs = thread.refs {
-      if let lastMsgId = thread.lastMessageId, !refs.contains(lastMsgId) {
-        headers["References"] = "\(refs) \(lastMsgId)"
-      } else {
-        headers["References"] = refs
-      }
-    } else if let lastMsgId = thread.lastMessageId {
-      headers["References"] = lastMsgId
-    }
-
-    var attachments: [EmailAttachment] = []
-    if let taskId = thread.taskId,
-      let collected = ctx.taskArtifacts[taskId], !collected.isEmpty
-    {
-      for artifact in collected {
-        attachments.append(
-          EmailAttachment(
-            filename: artifact.filename,
-            content: artifact.data.base64EncodedString(),
-            contentType: artifact.mimeType
-          ))
-      }
-      ctx.taskArtifacts[taskId] = []
+    let from = formatFromAddress(name: configGet("from_name"), email: fromEmail)
+    let subject = buildReplySubject(thread.subject)
+    let headers = buildThreadingHeaders(lastMessageId: thread.lastMessageId, refs: thread.refs)
+    let attachments = collectAndClearArtifacts(taskId: thread.taskId, ctx: ctx)
+    if !attachments.isEmpty {
       logDebug("resend_reply: attached \(attachments.count) artifacts")
     }
 
     let params = SendEmailParams(
-      from: from, to: toList, subject: subject,
+      from: from, to: recipients.to, subject: subject,
       html: input.body, text: nil,
-      cc: ccList.isEmpty ? nil : ccList, bcc: nil,
+      cc: recipients.cc.isEmpty ? nil : recipients.cc, bcc: nil,
       replyTo: [fromEmail],
       headers: headers.isEmpty ? nil : headers,
       attachments: attachments.isEmpty ? nil : attachments
@@ -171,20 +125,17 @@ struct ResendReplyTool {
 
     DatabaseManager.insertMessage(
       threadId: input.thread_id, emailId: emailId, direction: "out",
-      fromAddress: fromEmail, toAddress: toList,
-      ccAddress: ccList, bccAddress: [],
+      fromAddress: fromEmail, toAddress: recipients.to,
+      ccAddress: recipients.cc, bccAddress: [],
       subject: subject, bodyText: nil, bodyHtml: input.body,
       messageId: nil, inReplyTo: thread.lastMessageId,
       hasAttachments: !attachments.isEmpty
     )
 
     var updatedParticipants = Set(thread.participants.map { $0.lowercased() })
-    for addr in toList + ccList { updatedParticipants.insert(addr.lowercased()) }
-
+    for addr in recipients.to + recipients.cc { updatedParticipants.insert(addr.lowercased()) }
     DatabaseManager.updateThread(
-      threadId: input.thread_id,
-      participants: Array(updatedParticipants)
-    )
+      threadId: input.thread_id, participants: Array(updatedParticipants))
 
     logInfo("resend_reply: replied in thread \(input.thread_id)")
     return "{\"thread_id\":\"\(input.thread_id)\",\"email_id\":\"\(emailId)\"}"

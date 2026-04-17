@@ -171,6 +171,28 @@ struct DatabaseTests {
     #expect(invoiceThreads.first?.threadId == "t-800")
   }
 
+  @Test("hasEmailId detects existing email")
+  func hasEmailIdCheck() {
+    MockHost.setUp()
+    DatabaseManager.initSchema()
+    #expect(DatabaseManager.hasEmailId("e-missing") == false)
+
+    DatabaseManager.createThread(
+      threadId: "t-eid", subject: "Dedup",
+      participants: ["a@a.com"], messageId: nil, refs: nil
+    )
+    DatabaseManager.insertMessage(
+      threadId: "t-eid", emailId: "e-exists", direction: "in",
+      fromAddress: "a@a.com", toAddress: ["agent@d.com"],
+      ccAddress: [], bccAddress: [],
+      subject: "Dedup", bodyText: "test", bodyHtml: nil,
+      messageId: nil, inReplyTo: nil, hasAttachments: false
+    )
+
+    #expect(DatabaseManager.hasEmailId("e-exists") == true)
+    #expect(DatabaseManager.hasEmailId("e-other") == false)
+  }
+
   @Test("hasSentTo returns true when outbound message exists")
   func hasSentToPositive() {
     MockHost.setUp()

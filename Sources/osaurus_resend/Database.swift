@@ -281,6 +281,16 @@ enum DatabaseManager {
     return count > 0
   }
 
+  static func hasEmailId(_ emailId: String) -> Bool {
+    let sql = "SELECT COUNT(*) FROM messages WHERE email_id = ?1"
+    guard let resultStr = dbQuery(sql, params: serializeParams([emailId])),
+      let rows = extractRows(resultStr),
+      let row = rows.first,
+      let count = row.first as? Int
+    else { return false }
+    return count > 0
+  }
+
   static func isParticipantInAnyThread(address: String) -> Bool {
     let cleaned = address.lowercased()
     let sql = """

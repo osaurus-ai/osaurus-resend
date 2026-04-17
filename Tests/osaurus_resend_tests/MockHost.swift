@@ -307,6 +307,12 @@ private let mockDbQuery: osr_db_query_fn = { sqlPtr, paramsPtr in
     return returnMessageRows(Array(matching.prefix(limit)))
   }
 
+  if sql.contains("SELECT COUNT(*)") && sql.contains("FROM messages WHERE email_id = ?1") {
+    guard let eid = paramValues.first as? String else { return returnRows([[0]]) }
+    let count = mockMessages.filter { ($0["email_id"] as? String) == eid }.count
+    return returnRows([[count]])
+  }
+
   if sql.contains("SELECT body_text FROM messages") {
     guard let tid = paramValues.first as? String else { return returnRows([]) }
     let matching = mockMessages.filter { ($0["thread_id"] as? String) == tid }

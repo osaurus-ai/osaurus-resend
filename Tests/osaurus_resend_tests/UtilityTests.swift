@@ -100,26 +100,4 @@ struct UtilityTests {
     let result = extractEmailAddress("\"Alice Smith\" <alice@example.com>")
     #expect(result == "alice@example.com")
   }
-
-  @Test("randomHexString has correct length")
-  func randomHexLength() {
-    let result = randomHexString(bytes: 16)
-    #expect(result.count == 32)
-  }
-
-  @Test("randomHexString contains only hex chars")
-  func randomHexChars() {
-    let result = randomHexString(bytes: 8)
-    let hexChars = CharacterSet(charactersIn: "0123456789abcdef")
-    for char in result.unicodeScalars {
-      #expect(hexChars.contains(char))
-    }
-  }
-
-  @Test("randomHexString produces different values")
-  func randomHexUnique() {
-    let a = randomHexString(bytes: 16)
-    let b = randomHexString(bytes: 16)
-    #expect(a != b)
-  }
 }

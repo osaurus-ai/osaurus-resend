@@ -37,18 +37,13 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
   }
 
   let emailId = event.data.email_id
-  if ctx.processedEmailIds.contains(emailId) {
-    logDebug("handleWebhook: skipping duplicate email_id=\(emailId)")
+  if DatabaseManager.hasEmailId(emailId) {
+    logDebug("handleWebhook: skipping already-processed email_id=\(emailId)")
     return makeRouteResponse(status: 200, body: "ok")
-  }
-  ctx.processedEmailIds.insert(emailId)
-  if ctx.processedEmailIds.count > 500 {
-    let oldest = ctx.processedEmailIds.prefix(ctx.processedEmailIds.count - 400)
-    for id in oldest { ctx.processedEmailIds.remove(id) }
   }
 
   let agentAddress = req.osaurus?.agent_address
-  logDebug("handleWebhook: email.received email_id=\(emailId)")
+  logDebug("handleWebhook: processing email_id=\(emailId)")
 
   processInboundEmail(ctx: ctx, eventData: event.data, agentAddress: agentAddress)
 
@@ -283,36 +278,33 @@ func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, event
 }
 
 private func handleTaskCompleted(ctx: PluginContext, taskId: String, eventJSON: String) {
-  guard let thread = DatabaseManager.getThreadByTaskId(taskId) else {
-    logDebug("handleTaskCompleted: no thread for task \(taskId)")
+  defer {
     ctx.taskArtifacts.removeValue(forKey: taskId)
     ctx.taskDispatchTimestamps.removeValue(forKey: taskId)
+  }
+
+  guard let thread = DatabaseManager.getThreadByTaskId(taskId) else {
+    logDebug("handleTaskCompleted: no thread for task \(taskId)")
     return
   }
 
-  let dispatchTime = ctx.taskDispatchTimestamps[taskId] ?? 0
-  let agentAlreadyReplied = DatabaseManager.hasOutboundMessageSince(
-    threadId: thread.threadId, sinceTimestamp: dispatchTime
-  )
+  defer { DatabaseManager.clearTaskId(threadId: thread.threadId) }
 
-  if agentAlreadyReplied {
+  let dispatchTime = ctx.taskDispatchTimestamps[taskId] ?? 0
+  if DatabaseManager.hasOutboundMessageSince(
+    threadId: thread.threadId, sinceTimestamp: dispatchTime)
+  {
     logDebug(
       "handleTaskCompleted: agent already replied in thread \(thread.threadId), skipping auto-reply"
     )
-    DatabaseManager.clearTaskId(threadId: thread.threadId)
-    ctx.taskArtifacts.removeValue(forKey: taskId)
-    ctx.taskDispatchTimestamps.removeValue(forKey: taskId)
     return
   }
 
-  let event = parseJSON(eventJSON, as: TaskCompletedEvent.self)
-  let summary = event?.output ?? event?.summary ?? ""
-
+  let summary =
+    parseJSON(eventJSON, as: TaskCompletedEvent.self)
+    .map { $0.output ?? $0.summary ?? "" } ?? ""
   if summary.isEmpty {
     logDebug("handleTaskCompleted: empty summary, skipping auto-reply")
-    DatabaseManager.clearTaskId(threadId: thread.threadId)
-    ctx.taskArtifacts.removeValue(forKey: taskId)
-    ctx.taskDispatchTimestamps.removeValue(forKey: taskId)
     return
   }
 
@@ -320,98 +312,56 @@ private func handleTaskCompleted(ctx: PluginContext, taskId: String, eventJSON: 
     let fromEmail = configGet("from_email"), !fromEmail.isEmpty
   else {
     logWarn("handleTaskCompleted: missing config, cannot auto-reply")
-    DatabaseManager.clearTaskId(threadId: thread.threadId)
-    ctx.taskArtifacts.removeValue(forKey: taskId)
-    ctx.taskDispatchTimestamps.removeValue(forKey: taskId)
     return
   }
 
-  let fromName = configGet("from_name") ?? ""
-  let from = fromName.isEmpty ? fromEmail : "\(fromName) <\(fromEmail)>"
-  let fromLower = fromEmail.lowercased()
-
-  let lastInbound = DatabaseManager.getLastInboundMessage(threadId: thread.threadId)
-
-  let toList: [String]
-  var ccList: [String] = []
-
-  if let lastFrom = lastInbound?.fromAddress {
-    let replyTo = extractEmailAddress(lastFrom)
-    toList = [replyTo]
-    ccList = thread.participants.filter {
-      $0.lowercased() != fromLower && $0.lowercased() != replyTo.lowercased()
-    }
-  } else {
-    toList = thread.participants.filter { $0.lowercased() != fromLower }
-    if toList.isEmpty {
-      logWarn("handleTaskCompleted: no recipients for auto-reply")
-      DatabaseManager.clearTaskId(threadId: thread.threadId)
-      ctx.taskArtifacts.removeValue(forKey: taskId)
-      ctx.taskDispatchTimestamps.removeValue(forKey: taskId)
-      return
-    }
+  guard
+    let recipients = computeReplyRecipients(
+      thread: thread, fromEmail: fromEmail, explicitTo: nil)
+  else {
+    logWarn("handleTaskCompleted: no recipients for auto-reply")
+    return
   }
 
-  let subject =
-    thread.subject.map { sub in
-      sub.hasPrefix("Re:") ? sub : "Re: \(sub)"
-    } ?? "Re:"
-
-  var headers: [String: String] = [:]
-  if let lastMsgId = thread.lastMessageId {
-    headers["In-Reply-To"] = lastMsgId
-  }
-  if let refs = thread.refs {
-    headers["References"] = refs
-  }
-
-  var attachments: [EmailAttachment] = []
-  if let collected = ctx.taskArtifacts[taskId], !collected.isEmpty {
-    for artifact in collected {
-      attachments.append(
-        EmailAttachment(
-          filename: artifact.filename,
-          content: artifact.data.base64EncodedString(),
-          contentType: artifact.mimeType
-        ))
-    }
-  }
+  let from = formatFromAddress(name: configGet("from_name"), email: fromEmail)
+  let subject = buildReplySubject(thread.subject)
+  let headers = buildThreadingHeaders(lastMessageId: thread.lastMessageId, refs: thread.refs)
+  let attachments = collectAndClearArtifacts(taskId: taskId, ctx: ctx)
 
   let params = SendEmailParams(
-    from: from, to: toList, subject: subject,
+    from: from, to: recipients.to, subject: subject,
     html: summary, text: nil,
-    cc: ccList.isEmpty ? nil : ccList, bcc: nil,
+    cc: recipients.cc.isEmpty ? nil : recipients.cc, bcc: nil,
     replyTo: [fromEmail],
     headers: headers.isEmpty ? nil : headers,
     attachments: attachments.isEmpty ? nil : attachments
   )
 
   let (emailId, error) = resendSendEmail(apiKey: apiKey, params: params)
-  if let emailId {
-    DatabaseManager.insertMessage(
-      threadId: thread.threadId, emailId: emailId, direction: "out",
-      fromAddress: fromEmail, toAddress: toList, ccAddress: ccList, bccAddress: [],
-      subject: subject, bodyText: nil, bodyHtml: summary,
-      messageId: nil, inReplyTo: thread.lastMessageId,
-      hasAttachments: !attachments.isEmpty
-    )
-    logInfo("Auto-replied in thread \(thread.threadId) with \(attachments.count) attachments")
-  } else {
+  guard let emailId else {
     logError("handleTaskCompleted: auto-reply failed: \(error ?? "unknown")")
+    return
   }
 
-  DatabaseManager.clearTaskId(threadId: thread.threadId)
-  ctx.taskArtifacts.removeValue(forKey: taskId)
-  ctx.taskDispatchTimestamps.removeValue(forKey: taskId)
+  DatabaseManager.insertMessage(
+    threadId: thread.threadId, emailId: emailId, direction: "out",
+    fromAddress: fromEmail, toAddress: recipients.to, ccAddress: recipients.cc, bccAddress: [],
+    subject: subject, bodyText: nil, bodyHtml: summary,
+    messageId: nil, inReplyTo: thread.lastMessageId,
+    hasAttachments: !attachments.isEmpty
+  )
+  logInfo("Auto-replied in thread \(thread.threadId) with \(attachments.count) attachments")
 }
 
 private func handleTaskFailed(ctx: PluginContext, taskId: String, eventJSON: String) {
+  defer {
+    ctx.taskArtifacts.removeValue(forKey: taskId)
+    ctx.taskDispatchTimestamps.removeValue(forKey: taskId)
+  }
   if let thread = DatabaseManager.getThreadByTaskId(taskId) {
     DatabaseManager.clearTaskId(threadId: thread.threadId)
     logInfo("Task \(taskId) failed/cancelled, no email sent")
   }
-  ctx.taskArtifacts.removeValue(forKey: taskId)
-  ctx.taskDispatchTimestamps.removeValue(forKey: taskId)
 }
 
 // MARK: - Artifact Handler
@@ -457,10 +407,7 @@ func handleArtifactShare(ctx: PluginContext, payload: String) -> String {
 }
 
 private func findActiveTaskId(ctx: PluginContext) -> String? {
-  for (taskId, _) in ctx.taskDispatchTimestamps {
-    return taskId
-  }
-  return nil
+  ctx.taskDispatchTimestamps.max(by: { $0.value < $1.value })?.key
 }
 
 // MARK: - Health Endpoint

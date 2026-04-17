@@ -6,8 +6,6 @@ final class PluginContext: @unchecked Sendable {
   var tunnelURL: String?
   var taskArtifacts: [String: [CollectedArtifact]] = [:]
   var taskDispatchTimestamps: [String: Int] = [:]
-  var processedEmailIds: Set<String> = []
-  private static let maxProcessedIds = 500
 
   let sendTool = ResendSendTool()
   let replyTool = ResendReplyTool()
