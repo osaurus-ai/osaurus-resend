@@ -9,6 +9,7 @@ nonisolated(unsafe) var mockThreads: [[String: Any]] = []
 nonisolated(unsafe) var mockMessages: [[String: Any]] = []
 nonisolated(unsafe) var mockNextMessageId: Int = 1
 nonisolated(unsafe) var mockHTTPResponses: [String] = []
+nonisolated(unsafe) var mockHTTPRequests: [String] = []
 nonisolated(unsafe) var mockDispatchCalls: [String] = []
 nonisolated(unsafe) var mockDispatchResult: String = "{\"id\":\"task-001\",\"status\":\"running\"}"
 nonisolated(unsafe) var mockFileContents: [String: String] = [:]
@@ -24,6 +25,7 @@ enum MockHost {
     mockMessages = []
     mockNextMessageId = 1
     mockHTTPResponses = []
+    mockHTTPRequests = []
     mockDispatchCalls = []
     mockDispatchResult = "{\"id\":\"task-001\",\"status\":\"running\"}"
     mockFileContents = [:]
@@ -121,6 +123,9 @@ private let mockLog: osr_log_fn = { level, msgPtr in
 }
 
 private let mockHttpRequest: osr_http_request_fn = { requestPtr in
+  if let requestPtr {
+    mockHTTPRequests.append(String(cString: requestPtr))
+  }
   guard !mockHTTPResponses.isEmpty else {
     return mockStr("{\"status\":500,\"body\":\"{}\"}")
   }

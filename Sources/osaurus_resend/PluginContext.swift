@@ -50,23 +50,23 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
     setupWebhook(ctx: ctx, apiKey: apiKey, tunnelURL: newURL)
 
   case "api_key":
+    // Note: when the user rotates to a different Resend account, we cannot
+    // delete the old account's webhook -- we no longer have its API key.
+    // The reconcile in setupWebhook will at least dedupe on the new account.
     let newKey = (value?.isEmpty == false) ? value : nil
 
-    if let oldWebhookId = configGet("webhook_id"), !oldWebhookId.isEmpty,
-      let oldKey = configGet("api_key"), !oldKey.isEmpty
-    {
-      _ = resendDeleteWebhook(apiKey: oldKey, webhookId: oldWebhookId)
+    guard let newKey else {
       configDelete("webhook_id")
       configDelete("signing_secret")
-      configDelete("webhook_registered")
-      logInfo("Old webhook deleted")
-    }
-
-    guard let newKey else {
       configDelete("webhook_registered")
       logInfo("API key cleared")
       return
     }
+
+    // Stored webhook_id belongs to whichever account the previous key referenced;
+    // drop it so reconcile rediscovers from the new account.
+    configDelete("webhook_id")
+    configDelete("signing_secret")
 
     guard let tunnelURL = ctx.tunnelURL, !tunnelURL.isEmpty else {
       logDebug("onConfigChanged: api_key stored, waiting for tunnel_url")
@@ -86,26 +86,66 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
   }
 }
 
-// MARK: - Webhook Setup
+// MARK: - Webhook Setup (Reconcile)
 
+/// Idempotently ensures exactly one Resend webhook exists for our plugin endpoint.
+///
+/// Flow:
+/// 1. List all webhooks on the account.
+/// 2. Filter to those whose endpoint targets our plugin path.
+/// 3. Pick a keeper (preferring one that already matches the desired URL).
+/// 4. Delete any extras.
+/// 5. PATCH the keeper if its endpoint differs, otherwise create one.
 private func setupWebhook(ctx: PluginContext, apiKey: String, tunnelURL: String) {
   let pluginId = "osaurus.resend"
-  let webhookURL = "\(tunnelURL)/plugins/\(pluginId)/webhook"
+  let endpointSuffix = "/plugins/\(pluginId)/webhook"
+  let desiredURL = "\(tunnelURL)\(endpointSuffix)"
 
-  logDebug("setupWebhook: registering at \(webhookURL)")
+  logDebug("setupWebhook: reconciling for \(desiredURL)")
 
-  let (webhookId, signingSecret) = resendCreateWebhook(apiKey: apiKey, endpoint: webhookURL)
-
-  guard let webhookId else {
-    logError("Failed to register webhook")
+  guard let existing = resendListWebhooks(apiKey: apiKey) else {
+    logError("setupWebhook: failed to list webhooks; aborting")
     configDelete("webhook_registered")
     return
   }
 
+  let ours = existing.filter { $0.endpoint.hasSuffix(endpointSuffix) }
+  let keeper = ours.first(where: { $0.endpoint == desiredURL }) ?? ours.first
+
+  for w in ours where w.id != keeper?.id {
+    if resendDeleteWebhook(apiKey: apiKey, webhookId: w.id) {
+      logInfo("setupWebhook: deleted stale webhook \(w.id) endpoint=\(w.endpoint)")
+    } else {
+      logWarn("setupWebhook: failed to delete stale webhook \(w.id)")
+    }
+  }
+
+  if let keeper {
+    if keeper.endpoint != desiredURL {
+      guard resendUpdateWebhook(apiKey: apiKey, webhookId: keeper.id, endpoint: desiredURL) else {
+        logError("setupWebhook: failed to update webhook endpoint")
+        configDelete("webhook_registered")
+        return
+      }
+      logInfo("setupWebhook: updated webhook \(keeper.id) -> \(desiredURL)")
+    } else {
+      logDebug("setupWebhook: webhook \(keeper.id) already points at \(desiredURL)")
+    }
+    configSet("webhook_id", keeper.id)
+    configSet("webhook_registered", "true")
+    return
+  }
+
+  let (webhookId, signingSecret) = resendCreateWebhook(apiKey: apiKey, endpoint: desiredURL)
+  guard let webhookId else {
+    logError("setupWebhook: failed to register webhook")
+    configDelete("webhook_registered")
+    return
+  }
   configSet("webhook_id", webhookId)
   if let signingSecret {
     configSet("signing_secret", signingSecret)
   }
   configSet("webhook_registered", "true")
-  logInfo("Webhook registered at \(webhookURL) (id: \(webhookId))")
+  logInfo("setupWebhook: registered \(desiredURL) (id: \(webhookId))")
 }

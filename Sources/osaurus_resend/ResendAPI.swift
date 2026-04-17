@@ -142,6 +142,12 @@ func resendGetReceivedEmail(apiKey: String, emailId: String) -> ResendReceivedEm
 
 // MARK: - Webhook Management
 
+struct ResendWebhookSummary {
+  let id: String
+  let endpoint: String
+  let events: [String]
+}
+
 func resendCreateWebhook(apiKey: String, endpoint: String) -> (
   webhookId: String?, signingSecret: String?
 ) {
@@ -159,5 +165,35 @@ func resendCreateWebhook(apiKey: String, endpoint: String) -> (
 
 func resendDeleteWebhook(apiKey: String, webhookId: String) -> Bool {
   let (ok, _) = resendRequest(apiKey: apiKey, method: "DELETE", path: "/webhooks/\(webhookId)")
+  return ok
+}
+
+/// Lists all webhooks for the account.
+/// Returns `nil` when the API call fails (so callers can distinguish transport failure
+/// from "no webhooks").
+func resendListWebhooks(apiKey: String) -> [ResendWebhookSummary]? {
+  let (ok, data) = resendRequest(apiKey: apiKey, method: "GET", path: "/webhooks")
+  guard ok, let data else { return nil }
+  guard let rows = data["data"] as? [[String: Any]] else {
+    logWarn("resendListWebhooks: response missing 'data' array")
+    return []
+  }
+  return rows.compactMap { row in
+    guard let id = row["id"] as? String,
+      let endpoint = row["endpoint"] as? String
+    else { return nil }
+    let events = row["events"] as? [String] ?? []
+    return ResendWebhookSummary(id: id, endpoint: endpoint, events: events)
+  }
+}
+
+func resendUpdateWebhook(apiKey: String, webhookId: String, endpoint: String) -> Bool {
+  let body: [String: Any] = [
+    "endpoint": endpoint,
+    "events": ["email.received"],
+    "status": "enabled",
+  ]
+  let (ok, _) = resendRequest(
+    apiKey: apiKey, method: "PATCH", path: "/webhooks/\(webhookId)", body: body)
   return ok
 }
