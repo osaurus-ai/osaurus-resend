@@ -107,6 +107,18 @@ private struct osr_plugin_api {
   var on_task_event: osr_on_task_event_t?
 }
 
+// MARK: - Task Lifecycle Event Types
+
+let OSR_TASK_EVENT_STARTED: Int32 = 0
+let OSR_TASK_EVENT_ACTIVITY: Int32 = 1
+let OSR_TASK_EVENT_PROGRESS: Int32 = 2
+let OSR_TASK_EVENT_CLARIFICATION: Int32 = 3
+let OSR_TASK_EVENT_COMPLETED: Int32 = 4
+let OSR_TASK_EVENT_FAILED: Int32 = 5
+let OSR_TASK_EVENT_CANCELLED: Int32 = 6
+let OSR_TASK_EVENT_OUTPUT: Int32 = 7
+let OSR_TASK_EVENT_DRAFT: Int32 = 8
+
 // MARK: - Global State
 
 nonisolated(unsafe) var hostAPI: UnsafePointer<osr_host_api>?

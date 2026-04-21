@@ -90,10 +90,7 @@ private func processInboundEmail(
   let fromEmail = extractEmailAddress(fromAddress)
   let agentEmail = (configGet("from_email") ?? "").lowercased()
 
-  var thread: ThreadRow?
-  if let inReplyTo {
-    thread = DatabaseManager.getThreadByMessageId(inReplyTo)
-  }
+  let thread = inReplyTo.flatMap { DatabaseManager.getThreadByMessageId($0) }
 
   let allAddresses = Set(
     ([fromEmail] + toAddresses.map { extractEmailAddress($0) }
@@ -151,8 +148,8 @@ private func processInboundEmail(
   let titleText = subject ?? "Email from \(fromEmail)"
   var dispatchPayload: [String: Any] = [
     "prompt": prompt,
-    "mode": "work",
     "title": "Email: \(String(titleText.prefix(60)))",
+    "external_session_key": "resend:thread:\(threadId)",
   ]
   if let agentAddress { dispatchPayload["agent_address"] = agentAddress }
 
@@ -266,11 +263,9 @@ private func buildEmailPrompt(
 
 func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, eventJSON: String) {
   switch eventType {
-  case 4:  // COMPLETED
+  case OSR_TASK_EVENT_COMPLETED:
     handleTaskCompleted(ctx: ctx, taskId: taskId, eventJSON: eventJSON)
-  case 5:  // FAILED
-    handleTaskFailed(ctx: ctx, taskId: taskId, eventJSON: eventJSON)
-  case 6:  // CANCELLED
+  case OSR_TASK_EVENT_FAILED, OSR_TASK_EVENT_CANCELLED:
     handleTaskFailed(ctx: ctx, taskId: taskId, eventJSON: eventJSON)
   default:
     break
@@ -385,8 +380,7 @@ func handleArtifactShare(ctx: PluginContext, payload: String) -> String {
     return "{\"error\":\"Failed to read artifact\"}"
   }
 
-  let activeTaskId = findActiveTaskId(ctx: ctx)
-  guard let taskId = activeTaskId else {
+  guard let taskId = mostRecentTaskId(ctx: ctx) else {
     logDebug("handleArtifactShare: no active task, skipping")
     return "{\"skipped\":true}"
   }
@@ -396,17 +390,13 @@ func handleArtifactShare(ctx: PluginContext, payload: String) -> String {
     data: file.data,
     mimeType: artifact.mime_type ?? file.mimeType
   )
-
-  if ctx.taskArtifacts[taskId] == nil {
-    ctx.taskArtifacts[taskId] = []
-  }
-  ctx.taskArtifacts[taskId]?.append(collected)
+  ctx.taskArtifacts[taskId, default: []].append(collected)
 
   logDebug("handleArtifactShare: collected \(artifact.filename) for task \(taskId)")
   return "{\"collected\":true}"
 }
 
-private func findActiveTaskId(ctx: PluginContext) -> String? {
+private func mostRecentTaskId(ctx: PluginContext) -> String? {
   ctx.taskDispatchTimestamps.max(by: { $0.value < $1.value })?.key
 }
 
