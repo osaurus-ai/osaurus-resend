@@ -26,6 +26,10 @@ struct ResendSendTool {
       return "{\"error\":\"from_email not configured\"}"
     }
 
+    if let blocked = checkSuppressed([input.to, input.cc, input.bcc].compactMap { $0 }) {
+      return blocked
+    }
+
     let from = formatFromAddress(name: configGet("from_name"), email: fromEmail)
     let toList = [input.to]
     let ccList = input.cc.map { [$0] }
@@ -99,6 +103,10 @@ struct ResendReplyTool {
         thread: thread, fromEmail: fromEmail, explicitTo: input.to)
     else {
       return "{\"error\":\"No recipients found in thread\"}"
+    }
+
+    if let blocked = checkSuppressed(recipients.to + recipients.cc) {
+      return blocked
     }
 
     let from = formatFromAddress(name: configGet("from_name"), email: fromEmail)

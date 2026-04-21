@@ -39,13 +39,43 @@ enum DatabaseManager {
         FOREIGN KEY (thread_id) REFERENCES threads(thread_id)
       )
       """,
+      """
+      CREATE TABLE IF NOT EXISTS suppressed_addresses (
+        address    TEXT PRIMARY KEY,
+        reason     TEXT,
+        email_id   TEXT,
+        created_at INTEGER DEFAULT (unixepoch())
+      )
+      """,
+      """
+      CREATE TABLE IF NOT EXISTS email_events (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        email_id   TEXT NOT NULL,
+        type       TEXT NOT NULL,
+        detail     TEXT,
+        created_at INTEGER DEFAULT (unixepoch())
+      )
+      """,
+      """
+      CREATE TABLE IF NOT EXISTS processed_svix_ids (
+        svix_id    TEXT PRIMARY KEY,
+        created_at INTEGER DEFAULT (unixepoch())
+      )
+      """,
       "CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, created_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id)",
+      "CREATE INDEX IF NOT EXISTS idx_messages_email_id ON messages(email_id)",
       "CREATE INDEX IF NOT EXISTS idx_threads_updated ON threads(updated_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_email_events_email ON email_events(email_id, created_at DESC)",
     ]
     for sql in statements {
       dbExec(sql, params: "[]")
     }
+
+    // Best-effort GC of replay-protection rows older than 30 days.
+    dbExec(
+      "DELETE FROM processed_svix_ids WHERE created_at < (unixepoch() - 2592000)",
+      params: "[]")
   }
 
   // MARK: - Threads
@@ -303,6 +333,94 @@ enum DatabaseManager {
       let count = row.first as? Int
     else { return false }
     return count > 0
+  }
+
+  // MARK: - Outbound Lookup
+
+  /// Finds the thread that contains an outbound message with the given Resend `email_id`.
+  /// Used by lifecycle handlers to associate bounce/failure events with a thread/task.
+  static func getThreadByOutboundEmailId(_ emailId: String) -> ThreadRow? {
+    let sql = """
+      SELECT t.thread_id, t.subject, t.participants, t.last_message_id, t.refs, t.task_id, t.labels, t.created_at, t.updated_at
+      FROM threads t
+      JOIN messages m ON m.thread_id = t.thread_id
+      WHERE m.email_id = ?1 AND m.direction = 'out'
+      ORDER BY t.updated_at DESC LIMIT 1
+      """
+    guard let resultStr = dbQuery(sql, params: serializeParams([emailId])),
+      let rows = extractRows(resultStr),
+      let row = rows.first
+    else { return nil }
+    return threadRowFromArray(row)
+  }
+
+  // MARK: - Suppression List
+
+  /// Records (or refreshes) a suppression entry for an address. Idempotent on the
+  /// address PRIMARY KEY: re-suppression updates `reason` / `email_id` /
+  /// `created_at` so the most recent reason wins.
+  static func suppressAddress(address: String, reason: String, emailId: String?) {
+    let cleaned = address.lowercased()
+    let sql = """
+      INSERT INTO suppressed_addresses (address, reason, email_id, created_at)
+      VALUES (?1, ?2, ?3, unixepoch())
+      ON CONFLICT(address) DO UPDATE SET
+        reason = excluded.reason,
+        email_id = excluded.email_id,
+        created_at = excluded.created_at
+      """
+    dbExec(sql, params: serializeParams([cleaned, reason, emailId ?? NSNull()]))
+  }
+
+  /// Returns the suppression reason if the address is suppressed, else `nil`.
+  static func getSuppression(address: String) -> String? {
+    let cleaned = address.lowercased()
+    let sql = "SELECT reason, created_at FROM suppressed_addresses WHERE address = ?1 LIMIT 1"
+    guard let resultStr = dbQuery(sql, params: serializeParams([cleaned])),
+      let rows = extractRows(resultStr),
+      let row = rows.first
+    else { return nil }
+    let reason = row.first as? String ?? "suppressed"
+    let createdAt = (row.count > 1) ? (row[1] as? Int) : nil
+    if let ts = createdAt {
+      let date = Date(timeIntervalSince1970: TimeInterval(ts))
+      let formatter = DateFormatter()
+      formatter.dateFormat = "yyyy-MM-dd"
+      return "\(reason) (\(formatter.string(from: date)))"
+    }
+    return reason
+  }
+
+  // MARK: - Email Events Log
+
+  static func recordEmailEvent(emailId: String, type: String, detail: String?) {
+    let sql = """
+      INSERT INTO email_events (email_id, type, detail, created_at)
+      VALUES (?1, ?2, ?3, unixepoch())
+      """
+    dbExec(sql, params: serializeParams([emailId, type, detail ?? NSNull()]))
+  }
+
+  // MARK: - Svix Replay Protection
+
+  /// Records a Svix delivery id; returns `false` if the id has already been seen.
+  /// Backed by `INSERT OR IGNORE` against a PRIMARY KEY.
+  static func recordSvixId(_ svixId: String) -> Bool {
+    let countSQL = "SELECT COUNT(*) FROM processed_svix_ids WHERE svix_id = ?1"
+    if let resultStr = dbQuery(countSQL, params: serializeParams([svixId])),
+      let rows = extractRows(resultStr),
+      let row = rows.first,
+      let count = row.first as? Int,
+      count > 0
+    {
+      return false
+    }
+    let insertSQL = """
+      INSERT OR IGNORE INTO processed_svix_ids (svix_id, created_at)
+      VALUES (?1, unixepoch())
+      """
+    dbExec(insertSQL, params: serializeParams([svixId]))
+    return true
   }
 
   // MARK: - Parsing Helpers

@@ -18,6 +18,16 @@ struct ResendEmailEventData: Decodable {
   let subject: String?
   let message_id: String?
   let attachments: [ResendAttachmentMeta]?
+  let bounce: ResendBounceInfo?
+
+  /// Convenience accessor for the bounce message (if this event is a bounce).
+  var bounce_message: String? { bounce?.message }
+}
+
+struct ResendBounceInfo: Decodable {
+  let message: String?
+  let subType: String?
+  let type: String?
 }
 
 struct ResendAttachmentMeta: Decodable {

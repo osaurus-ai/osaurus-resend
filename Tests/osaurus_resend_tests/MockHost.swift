@@ -3,6 +3,18 @@ import Foundation
 @testable import osaurus_resend
 
 // MARK: - Mock Host State
+//
+// All globals below are mutated from C callbacks invoked on whichever thread the
+// production code happens to use. Swift Testing runs separate suites in parallel,
+// so a single global lock guards every mutation to keep tests deterministic.
+
+nonisolated(unsafe) let mockStateLock = NSRecursiveLock()
+
+private func withMockLock<T>(_ block: () -> T) -> T {
+  mockStateLock.lock()
+  defer { mockStateLock.unlock() }
+  return block()
+}
 
 nonisolated(unsafe) var mockConfig: [String: String] = [:]
 nonisolated(unsafe) var mockThreads: [[String: Any]] = []
@@ -18,37 +30,58 @@ nonisolated(unsafe) var mockHostAPIStorage = osr_host_api()
 
 // MARK: - MockHost Setup
 
+nonisolated(unsafe) var mockSuppressedAddresses: [String: (reason: String, createdAt: Int)] = [:]
+nonisolated(unsafe) var mockEmailEvents: [(emailId: String, type: String, detail: String?)] = []
+nonisolated(unsafe) var mockSvixIds: Set<String> = []
+nonisolated(unsafe) var mockAddIssueCalls: [(taskId: String, payload: String)] = []
+
 enum MockHost {
   static func setUp() {
-    mockConfig = [:]
-    mockThreads = []
-    mockMessages = []
-    mockNextMessageId = 1
-    mockHTTPResponses = []
-    mockHTTPRequests = []
-    mockDispatchCalls = []
-    mockDispatchResult = "{\"id\":\"task-001\",\"status\":\"running\"}"
-    mockFileContents = [:]
-    mockLogMessages = []
+    withMockLock {
+      mockConfig = [:]
+      mockThreads = []
+      mockMessages = []
+      mockNextMessageId = 1
+      mockHTTPResponses = []
+      mockHTTPRequests = []
+      mockDispatchCalls = []
+      mockDispatchResult = "{\"id\":\"task-001\",\"status\":\"running\"}"
+      mockFileContents = [:]
+      mockLogMessages = []
+      mockSuppressedAddresses = [:]
+      mockEmailEvents = []
+      mockSvixIds = []
+      mockAddIssueCalls = []
 
-    mockHostAPIStorage = osr_host_api()
-    mockHostAPIStorage.version = 2
-    mockHostAPIStorage.config_get = mockConfigGet
-    mockHostAPIStorage.config_set = mockConfigSet
-    mockHostAPIStorage.config_delete = mockConfigDelete
-    mockHostAPIStorage.db_exec = mockDbExec
-    mockHostAPIStorage.db_query = mockDbQuery
-    mockHostAPIStorage.log = mockLog
-    mockHostAPIStorage.http_request = mockHttpRequest
-    mockHostAPIStorage.dispatch = mockDispatch
-    mockHostAPIStorage.file_read = mockFileRead
+      // Make the resend retry/backoff loop instantaneous in tests so 429/5xx
+      // exploration doesn't sleep for seconds.
+      resendRetryBackoffOverrideMs = 0
+      // Disable client-side throttling by default; tests opt back in when
+      // they're explicitly verifying rate-limit behavior.
+      resendThrottleIntervalOverrideMs = 0
 
-    withUnsafePointer(to: &mockHostAPIStorage) { ptr in
-      hostAPI = ptr
+      mockHostAPIStorage = osr_host_api()
+      mockHostAPIStorage.version = 2
+      mockHostAPIStorage.config_get = mockConfigGet
+      mockHostAPIStorage.config_set = mockConfigSet
+      mockHostAPIStorage.config_delete = mockConfigDelete
+      mockHostAPIStorage.db_exec = mockDbExec
+      mockHostAPIStorage.db_query = mockDbQuery
+      mockHostAPIStorage.log = mockLog
+      mockHostAPIStorage.http_request = mockHttpRequest
+      mockHostAPIStorage.dispatch = mockDispatch
+      mockHostAPIStorage.file_read = mockFileRead
+      mockHostAPIStorage.dispatch_add_issue = mockDispatchAddIssue
+
+      withUnsafePointer(to: &mockHostAPIStorage) { ptr in
+        hostAPI = ptr
+      }
     }
   }
 
-  static func pushHTTPResponse(status: Int, body: [String: Any]) {
+  static func pushHTTPResponse(
+    status: Int, body: [String: Any], headers: [String: Any]? = nil
+  ) {
     let bodyStr: String
     if let data = try? JSONSerialization.data(withJSONObject: body),
       let str = String(data: data, encoding: .utf8)
@@ -57,15 +90,20 @@ enum MockHost {
     } else {
       bodyStr = "{}"
     }
-    let resp: [String: Any] = [
+    var resp: [String: Any] = [
       "status": status,
-      "headers": ["Content-Type": "application/json"],
+      "headers": headers ?? ["Content-Type": "application/json"],
       "body": bodyStr,
     ]
+    if let headers, headers["Content-Type"] == nil {
+      var merged = headers
+      merged["Content-Type"] = "application/json"
+      resp["headers"] = merged
+    }
     if let data = try? JSONSerialization.data(withJSONObject: resp),
       let str = String(data: data, encoding: .utf8)
     {
-      mockHTTPResponses.append(str)
+      withMockLock { mockHTTPResponses.append(str) }
     }
   }
 
@@ -98,57 +136,71 @@ enum MockHost {
 private let mockConfigGet: osr_config_get_fn = { keyPtr in
   guard let keyPtr else { return nil }
   let key = String(cString: keyPtr)
-  guard let value = mockConfig[key] else { return nil }
-  return mockStr(value)
+  return withMockLock {
+    guard let value = mockConfig[key] else { return nil as UnsafePointer<CChar>? }
+    return mockStr(value)
+  }
 }
 
 private let mockConfigSet: osr_config_set_fn = { keyPtr, valuePtr in
   guard let keyPtr else { return }
   let key = String(cString: keyPtr)
   if let valuePtr {
-    mockConfig[key] = String(cString: valuePtr)
+    let v = String(cString: valuePtr)
+    withMockLock { mockConfig[key] = v }
   }
 }
 
 private let mockConfigDelete: osr_config_delete_fn = { keyPtr in
   guard let keyPtr else { return }
   let key = String(cString: keyPtr)
-  mockConfig.removeValue(forKey: key)
+  withMockLock { _ = mockConfig.removeValue(forKey: key) }
 }
 
 private let mockLog: osr_log_fn = { level, msgPtr in
   guard let msgPtr else { return }
   let msg = String(cString: msgPtr)
-  mockLogMessages.append((level, msg))
+  withMockLock { mockLogMessages.append((level, msg)) }
 }
 
 private let mockHttpRequest: osr_http_request_fn = { requestPtr in
-  if let requestPtr {
-    mockHTTPRequests.append(String(cString: requestPtr))
+  let request = requestPtr.map { String(cString: $0) }
+  return withMockLock {
+    if let request { mockHTTPRequests.append(request) }
+    guard !mockHTTPResponses.isEmpty else {
+      return mockStr("{\"status\":500,\"body\":\"{}\"}")
+    }
+    let resp = mockHTTPResponses.removeFirst()
+    return mockStr(resp)
   }
-  guard !mockHTTPResponses.isEmpty else {
-    return mockStr("{\"status\":500,\"body\":\"{}\"}")
-  }
-  let resp = mockHTTPResponses.removeFirst()
-  return mockStr(resp)
 }
 
 private let mockDispatch: osr_dispatch_fn = { requestPtr in
   if let requestPtr {
     let req = String(cString: requestPtr)
-    mockDispatchCalls.append(req)
+    withMockLock { mockDispatchCalls.append(req) }
   }
-  return mockStr(mockDispatchResult)
+  let result = withMockLock { mockDispatchResult }
+  return mockStr(result)
 }
 
 private let mockFileRead: osr_file_read_fn = { pathPtr in
   guard let pathPtr else { return nil }
   let path = String(cString: pathPtr)
-  guard let content = mockFileContents[path] else {
+  let content = withMockLock { mockFileContents[path] }
+  guard let content else {
     let err = "{\"error\":\"File not found: \(path)\"}"
     return mockStr(err)
   }
   return mockStr(content)
+}
+
+private let mockDispatchAddIssue: osr_dispatch_add_issue_fn = { taskPtr, payloadPtr in
+  guard let taskPtr, let payloadPtr else { return nil }
+  let taskId = String(cString: taskPtr)
+  let payload = String(cString: payloadPtr)
+  withMockLock { mockAddIssueCalls.append((taskId: taskId, payload: payload)) }
+  return mockStr("{\"ok\":true}")
 }
 
 // MARK: - Mock DB
@@ -158,6 +210,10 @@ private let mockDbExec: osr_db_exec_fn = { sqlPtr, paramsPtr in
   let sql = String(cString: sqlPtr).trimmingCharacters(in: .whitespacesAndNewlines)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"
   let paramValues = parseParamArray(params)
+  return withMockLock { mockDbExecLocked(sql: sql, paramValues: paramValues) }
+}
+
+private func mockDbExecLocked(sql: String, paramValues: [Any]) -> UnsafePointer<CChar>? {
 
   if sql.hasPrefix("CREATE TABLE") || sql.hasPrefix("CREATE INDEX") {
     return mockStr("{\"ok\":true}")
@@ -177,6 +233,37 @@ private let mockDbExec: osr_db_exec_fn = { sqlPtr, paramsPtr in
       "updated_at": Int(Date().timeIntervalSince1970),
     ]
     mockThreads.append(thread)
+    return mockStr("{\"ok\":true}")
+  }
+
+  if sql.hasPrefix("INSERT INTO suppressed_addresses") {
+    if let addr = paramValues.first as? String {
+      let reason = (paramValues.count > 1) ? (paramValues[1] as? String ?? "") : ""
+      mockSuppressedAddresses[addr] = (
+        reason: reason, createdAt: Int(Date().timeIntervalSince1970)
+      )
+    }
+    return mockStr("{\"ok\":true}")
+  }
+
+  if sql.hasPrefix("INSERT INTO email_events") {
+    if paramValues.count >= 3, let eid = paramValues[0] as? String,
+      let type = paramValues[1] as? String
+    {
+      let detail = paramValues[2] as? String
+      mockEmailEvents.append((emailId: eid, type: type, detail: detail))
+    }
+    return mockStr("{\"ok\":true}")
+  }
+
+  if sql.hasPrefix("INSERT OR IGNORE INTO processed_svix_ids") {
+    if let sid = paramValues.first as? String {
+      mockSvixIds.insert(sid)
+    }
+    return mockStr("{\"ok\":true}")
+  }
+
+  if sql.hasPrefix("DELETE FROM processed_svix_ids") {
     return mockStr("{\"ok\":true}")
   }
 
@@ -242,6 +329,40 @@ private let mockDbQuery: osr_db_query_fn = { sqlPtr, paramsPtr in
   let sql = String(cString: sqlPtr).trimmingCharacters(in: .whitespacesAndNewlines)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"
   let paramValues = parseParamArray(params)
+  return withMockLock { mockDbQueryLocked(sql: sql, paramValues: paramValues) }
+}
+
+private func mockDbQueryLocked(sql: String, paramValues: [Any]) -> UnsafePointer<CChar>? {
+
+  if sql.contains("FROM suppressed_addresses WHERE address = ?1") {
+    guard let addr = paramValues.first as? String else { return returnRows([]) }
+    if let s = mockSuppressedAddresses[addr.lowercased()] {
+      return returnRows([[s.reason, s.createdAt]])
+    }
+    return returnRows([])
+  }
+
+  if sql.contains("FROM processed_svix_ids WHERE svix_id = ?1")
+    && sql.contains("SELECT COUNT(*)")
+  {
+    guard let sid = paramValues.first as? String else { return returnRows([[0]]) }
+    let count = mockSvixIds.contains(sid) ? 1 : 0
+    return returnRows([[count]])
+  }
+
+  if sql.contains("JOIN messages m ON m.thread_id = t.thread_id")
+    && sql.contains("WHERE m.email_id = ?1 AND m.direction = 'out'")
+  {
+    guard let eid = paramValues.first as? String else { return returnRows([]) }
+    let matchingMsgs = mockMessages.filter {
+      ($0["email_id"] as? String) == eid && ($0["direction"] as? String) == "out"
+    }
+    if let firstMsg = matchingMsgs.first, let threadId = firstMsg["thread_id"] as? String {
+      let matching = mockThreads.filter { ($0["thread_id"] as? String) == threadId }
+      return returnThreadRows(matching)
+    }
+    return returnRows([])
+  }
 
   if sql.contains("FROM threads") && sql.contains("WHERE thread_id = ?1")
     || sql.contains("WHERE thread_id = ?1 LIMIT 1")

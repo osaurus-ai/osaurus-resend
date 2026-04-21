@@ -70,6 +70,32 @@ func configDelete(_ key: String) {
   key.withCString { ptr in deleteValue(ptr) }
 }
 
+// MARK: - Route Helpers
+
+/// Builds the JSON envelope the host expects when a route handler returns.
+func makeRouteResponse(status: Int, body: String, contentType: String = "text/plain") -> String {
+  let resp: [String: Any] = [
+    "status": status,
+    "headers": ["Content-Type": contentType],
+    "body": body,
+  ]
+  return makeJSONString(resp) ?? "{\"status\":500}"
+}
+
+// MARK: - Email Address Helpers
+
+/// Extracts the bare email address from a value that may be either a plain
+/// `user@host` string or an RFC 5322 `Display Name <user@host>` form.
+func extractEmailAddress(_ raw: String) -> String {
+  if let start = raw.firstIndex(of: "<"),
+    let end = raw.firstIndex(of: ">"),
+    start < end
+  {
+    return String(raw[raw.index(after: start)..<end])
+  }
+  return raw.trimmingCharacters(in: .whitespaces)
+}
+
 // MARK: - Host File Reading
 
 struct HostFileResult {

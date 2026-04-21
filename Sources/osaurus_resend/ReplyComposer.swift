@@ -72,6 +72,26 @@ func buildThreadingHeaders(lastMessageId: String?, refs: String?) -> [String: St
   return headers
 }
 
+// MARK: - Suppression Check
+
+/// Returns a JSON error string if any of the provided addresses are on the
+/// suppression list, or `nil` if all recipients are clear to send.
+///
+/// Producing a structured error from the tool surface lets the agent see why
+/// the send was blocked and adjust (e.g., "the recipient bounced last week,
+/// pick a different contact") instead of silently re-trying a doomed send.
+func checkSuppressed(_ addresses: [String]) -> String? {
+  for raw in addresses {
+    let addr = extractEmailAddress(raw)
+    if addr.isEmpty { continue }
+    if let reason = DatabaseManager.getSuppression(address: addr) {
+      let escaped = escapeJSON("Recipient suppressed: \(addr) — \(reason)")
+      return "{\"error\":\"\(escaped)\"}"
+    }
+  }
+  return nil
+}
+
 // MARK: - Artifact Collection
 
 /// Collects and clears the queued artifacts for a task, converting to `EmailAttachment`.

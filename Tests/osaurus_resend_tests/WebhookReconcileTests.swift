@@ -15,7 +15,9 @@ struct WebhookReconcileTests {
   }
 
   /// Helper to push a `GET /webhooks` list response.
-  private func pushListResponse(_ webhooks: [(id: String, endpoint: String)]) {
+  private func pushListResponse(
+    _ webhooks: [(id: String, endpoint: String)], hasMore: Bool = false
+  ) {
     let data: [[String: Any]] = webhooks.map { w in
       [
         "id": w.id,
@@ -26,10 +28,21 @@ struct WebhookReconcileTests {
       ]
     }
     MockHost.pushHTTPResponse(
-      status: 200, body: ["object": "list", "has_more": false, "data": data])
+      status: 200, body: ["object": "list", "has_more": hasMore, "data": data])
+  }
+
+  /// Pushes the standard create-webhook 200 response.
+  private func pushCreateOkResponse(id: String = "wh-new", secret: String = "whsec_test") {
+    MockHost.pushHTTPResponse(status: 200, body: ["id": id, "signing_secret": secret])
+  }
+
+  /// Pushes a 200 OK delete response.
+  private func pushDeleteOkResponse() {
+    MockHost.pushHTTPResponse(status: 200, body: [:])
   }
 
   /// Returns the parsed (method, path) for each recorded HTTP request.
+  /// Path includes any query string so callers can assert on pagination params.
   private func parsedRequests() -> [(method: String, path: String)] {
     mockHTTPRequests.compactMap { raw -> (String, String)? in
       guard let data = raw.data(using: .utf8),
@@ -44,64 +57,48 @@ struct WebhookReconcileTests {
 
   // MARK: - Tests
 
-  @Test("Reconcile creates a new webhook when none exist")
-  func reconcileCreatesWhenNoMatches() {
+  @Test("Creates a fresh webhook when account has no existing osaurus webhook")
+  func createsWhenNoMatches() {
     MockHost.setUp()
     mockConfig["api_key"] = "re_test"
 
     pushListResponse([])
-    MockHost.pushHTTPResponse(
-      status: 200, body: ["id": "new-webhook-1", "signing_secret": "whsec_abc"])
+    pushCreateOkResponse(id: "new-webhook-1", secret: "whsec_abc")
 
     triggerReconcile(tunnelURL: "https://tunnel.example.com")
 
     let calls = parsedRequests()
     #expect(calls.count == 2)
-    #expect(calls[0].method == "GET" && calls[0].path == "/webhooks")
+    #expect(calls[0].method == "GET" && calls[0].path.hasPrefix("/webhooks"))
     #expect(calls[1].method == "POST" && calls[1].path == "/webhooks")
     #expect(mockConfig["webhook_id"] == "new-webhook-1")
     #expect(mockConfig["signing_secret"] == "whsec_abc")
     #expect(mockConfig["webhook_registered"] == "true")
   }
 
-  @Test("Reconcile keeps existing webhook when endpoint already matches")
-  func reconcileKeepsMatchingWebhook() {
+  @Test("Always wipes existing matching webhooks then creates a single fresh one")
+  func wipesAndRecreatesEvenOnMatch() {
     MockHost.setUp()
     mockConfig["api_key"] = "re_test"
 
     let desiredURL = "https://tunnel.example.com/plugins/osaurus.resend/webhook"
     pushListResponse([(id: "existing-1", endpoint: desiredURL)])
+    pushDeleteOkResponse()
+    pushCreateOkResponse(id: "wh-new", secret: "whsec_new")
 
     triggerReconcile(tunnelURL: "https://tunnel.example.com")
 
-    let calls = parsedRequests()
-    #expect(calls.count == 1, "Only the list call should be made")
-    #expect(calls[0].method == "GET")
-    #expect(mockConfig["webhook_id"] == "existing-1")
+    let methodPaths = parsedRequests().map { "\($0.method) \($0.path)" }
+    #expect(methodPaths.contains(where: { $0.hasPrefix("GET /webhooks") }))
+    #expect(methodPaths.contains("DELETE /webhooks/existing-1"))
+    #expect(methodPaths.contains("POST /webhooks"))
+    #expect(mockConfig["webhook_id"] == "wh-new")
+    #expect(mockConfig["signing_secret"] == "whsec_new")
     #expect(mockConfig["webhook_registered"] == "true")
   }
 
-  @Test("Reconcile patches existing webhook when endpoint differs")
-  func reconcilePatchesWhenEndpointDiffers() {
-    MockHost.setUp()
-    mockConfig["api_key"] = "re_test"
-
-    let oldURL = "https://old-tunnel.example.com/plugins/osaurus.resend/webhook"
-    pushListResponse([(id: "existing-1", endpoint: oldURL)])
-    MockHost.pushHTTPResponse(status: 200, body: ["id": "existing-1"])
-
-    triggerReconcile(tunnelURL: "https://new-tunnel.example.com")
-
-    let calls = parsedRequests()
-    #expect(calls.count == 2)
-    #expect(calls[0].method == "GET")
-    #expect(calls[1].method == "PATCH" && calls[1].path == "/webhooks/existing-1")
-    #expect(mockConfig["webhook_id"] == "existing-1")
-    #expect(mockConfig["webhook_registered"] == "true")
-  }
-
-  @Test("Reconcile deletes duplicates and keeps one")
-  func reconcileDeletesDuplicates() {
+  @Test("Deletes every matching webhook before creating one")
+  func deletesAllDuplicates() {
     MockHost.setUp()
     mockConfig["api_key"] = "re_test"
 
@@ -110,28 +107,26 @@ struct WebhookReconcileTests {
 
     pushListResponse([
       (id: "wh-stale-1", endpoint: staleURL),
-      (id: "wh-keeper", endpoint: desiredURL),
+      (id: "wh-existing", endpoint: desiredURL),
       (id: "wh-stale-2", endpoint: staleURL),
     ])
-    MockHost.pushHTTPResponse(status: 200, body: [:])
-    MockHost.pushHTTPResponse(status: 200, body: [:])
+    pushDeleteOkResponse()
+    pushDeleteOkResponse()
+    pushDeleteOkResponse()
+    pushCreateOkResponse(id: "wh-final")
 
     triggerReconcile(tunnelURL: "https://tunnel.example.com")
 
-    let calls = parsedRequests()
-    let methodPaths = calls.map { "\($0.method) \($0.path)" }
-    #expect(calls.count == 3)
-    #expect(methodPaths.contains("GET /webhooks"))
+    let methodPaths = parsedRequests().map { "\($0.method) \($0.path)" }
     #expect(methodPaths.contains("DELETE /webhooks/wh-stale-1"))
+    #expect(methodPaths.contains("DELETE /webhooks/wh-existing"))
     #expect(methodPaths.contains("DELETE /webhooks/wh-stale-2"))
-    #expect(!methodPaths.contains("DELETE /webhooks/wh-keeper"))
-    #expect(!methodPaths.contains(where: { $0.hasPrefix("POST") }))
-    #expect(!methodPaths.contains(where: { $0.hasPrefix("PATCH") }))
-    #expect(mockConfig["webhook_id"] == "wh-keeper")
+    #expect(methodPaths.filter { $0.hasPrefix("POST") }.count == 1)
+    #expect(mockConfig["webhook_id"] == "wh-final")
   }
 
-  @Test("Reconcile ignores webhooks for other plugins/endpoints")
-  func reconcileIgnoresOtherWebhooks() {
+  @Test("Does NOT touch webhooks belonging to other plugins/apps")
+  func ignoresOtherWebhooks() {
     MockHost.setUp()
     mockConfig["api_key"] = "re_test"
 
@@ -139,24 +134,23 @@ struct WebhookReconcileTests {
       (id: "other-1", endpoint: "https://example.com/some/other/handler"),
       (id: "other-2", endpoint: "https://example.com/plugins/different.plugin/webhook"),
     ])
-    MockHost.pushHTTPResponse(
-      status: 200, body: ["id": "new-webhook", "signing_secret": "whsec_xyz"])
+    pushCreateOkResponse(id: "new-webhook")
 
     triggerReconcile(tunnelURL: "https://tunnel.example.com")
 
-    let calls = parsedRequests()
-    let methodPaths = calls.map { "\($0.method) \($0.path)" }
-    #expect(methodPaths == ["GET /webhooks", "POST /webhooks"])
+    let methodPaths = parsedRequests().map { "\($0.method) \($0.path)" }
     #expect(!methodPaths.contains(where: { $0.hasPrefix("DELETE") }))
+    #expect(methodPaths.contains("POST /webhooks"))
     #expect(mockConfig["webhook_id"] == "new-webhook")
   }
 
-  @Test("Reconcile aborts cleanly when list fails")
-  func reconcileAbortsOnListFailure() {
+  @Test("Aborts and clears registration flag when listing fails")
+  func abortsOnListFailure() {
     MockHost.setUp()
     mockConfig["api_key"] = "re_test"
 
-    MockHost.pushHTTPResponse(status: 500, body: ["message": "internal error"])
+    // Use 422 so the retry loop doesn't kick in (5xx would retry up to 3 more times).
+    MockHost.pushHTTPResponse(status: 422, body: ["message": "invalid"])
 
     triggerReconcile(tunnelURL: "https://tunnel.example.com")
 
@@ -167,7 +161,70 @@ struct WebhookReconcileTests {
     #expect(mockConfig["webhook_registered"] == nil)
   }
 
-  @Test("Tunnel URL change reconciles instead of leaking webhooks")
+  @Test("Subscribes to the full lifecycle event set on create")
+  func subscribesToLifecycleEvents() {
+    MockHost.setUp()
+    mockConfig["api_key"] = "re_test"
+
+    pushListResponse([])
+    pushCreateOkResponse(id: "wh-events")
+
+    triggerReconcile(tunnelURL: "https://tunnel.example.com")
+
+    // Find the POST and inspect its body.
+    let postBody = mockHTTPRequests.compactMap { raw -> [String: Any]? in
+      guard let data = raw.data(using: .utf8),
+        let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        (dict["method"] as? String) == "POST",
+        let bodyStr = dict["body"] as? String,
+        let bodyData = bodyStr.data(using: .utf8),
+        let body = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
+      else { return nil }
+      return body
+    }.first
+
+    let events = postBody?["events"] as? [String] ?? []
+    #expect(events.contains("email.received"))
+    #expect(events.contains("email.bounced"))
+    #expect(events.contains("email.complained"))
+    #expect(events.contains("email.failed"))
+    #expect(events.contains("email.delivered"))
+  }
+
+  @Test("Pagination: combines results across multiple pages")
+  func paginatesList() {
+    MockHost.setUp()
+    mockConfig["api_key"] = "re_test"
+
+    // First page: 100 unrelated webhooks (signals more pages exist).
+    var page1: [(id: String, endpoint: String)] = []
+    for i in 0..<100 {
+      page1.append(
+        (id: "unrelated-\(i)", endpoint: "https://other.example.com/handler/\(i)"))
+    }
+    pushListResponse(page1, hasMore: true)
+
+    // Second page: contains our match.
+    let oursURL = "https://tunnel.example.com/plugins/osaurus.resend/webhook"
+    pushListResponse([(id: "our-page2", endpoint: oursURL)], hasMore: false)
+
+    pushDeleteOkResponse()
+    pushCreateOkResponse(id: "wh-fresh")
+
+    triggerReconcile(tunnelURL: "https://tunnel.example.com")
+
+    let methodPaths = parsedRequests().map { "\($0.method) \($0.path)" }
+    // Both pages must have been fetched.
+    #expect(methodPaths.contains(where: { $0.contains("offset=0") }))
+    #expect(methodPaths.contains(where: { $0.contains("offset=100") }))
+    // The match found on page 2 must have been deleted, and we must NOT have
+    // touched the unrelated webhooks from page 1.
+    #expect(methodPaths.contains("DELETE /webhooks/our-page2"))
+    #expect(!methodPaths.contains(where: { $0.hasPrefix("DELETE /webhooks/unrelated-") }))
+    #expect(mockConfig["webhook_id"] == "wh-fresh")
+  }
+
+  @Test("Tunnel URL change re-runs nuke-and-create cleanly")
   func tunnelChangeDoesNotLeak() {
     MockHost.setUp()
     mockConfig["api_key"] = "re_test"
@@ -178,24 +235,82 @@ struct WebhookReconcileTests {
 
     // First setup: nothing exists, create.
     pushListResponse([])
-    MockHost.pushHTTPResponse(
-      status: 200, body: ["id": "wh-001", "signing_secret": "whsec_1"])
+    pushCreateOkResponse(id: "wh-001", secret: "whsec_1")
 
-    // Second setup (tunnel URL changed): list returns our existing one, patch updates.
+    // Second setup (tunnel URL changed): list returns the existing one,
+    // delete it, then create a fresh one with a fresh secret.
     pushListResponse([(id: "wh-001", endpoint: url1)])
-    MockHost.pushHTTPResponse(status: 200, body: ["id": "wh-001"])
+    pushDeleteOkResponse()
+    pushCreateOkResponse(id: "wh-002", secret: "whsec_2")
 
     let ctx = PluginContext()
     triggerReconcile(tunnelURL: tunnel1, ctx: ctx)
     triggerReconcile(tunnelURL: tunnel2, ctx: ctx)
 
-    let calls = parsedRequests()
-    let methodPaths = calls.map { "\($0.method) \($0.path)" }
-    #expect(
-      methodPaths == [
-        "GET /webhooks", "POST /webhooks",
-        "GET /webhooks", "PATCH /webhooks/wh-001",
-      ])
-    #expect(mockConfig["webhook_id"] == "wh-001")
+    let methodPaths = parsedRequests().map { "\($0.method) \($0.path)" }
+    #expect(methodPaths.contains("DELETE /webhooks/wh-001"))
+    #expect(methodPaths.filter { $0.hasPrefix("POST") }.count == 2)
+    #expect(mockConfig["webhook_id"] == "wh-002")
+    #expect(mockConfig["signing_secret"] == "whsec_2")
+  }
+
+  @Test("initPlugin auto-reconciles when api_key + tunnel_url are already configured")
+  func initAutoReconciles() {
+    MockHost.setUp()
+    // Persisted config from a previous run.
+    mockConfig["api_key"] = "re_test"
+    mockConfig["tunnel_url"] = "https://tunnel.example.com"
+    mockConfig["webhook_id"] = "wh-leftover"
+    mockConfig["signing_secret"] = "whsec_old"
+    mockConfig["webhook_registered"] = "true"
+
+    // Resend currently has two stale webhooks of ours. Init must wipe both
+    // before creating a single fresh one, regardless of any local config.
+    let oursURL = "https://tunnel.example.com/plugins/osaurus.resend/webhook"
+    pushListResponse([
+      (id: "wh-leftover", endpoint: oursURL),
+      (id: "wh-other-stale", endpoint: oursURL),
+    ])
+    pushDeleteOkResponse()
+    pushDeleteOkResponse()
+    pushCreateOkResponse(id: "wh-init-fresh", secret: "whsec_init_fresh")
+
+    initPlugin(PluginContext())
+
+    let methodPaths = parsedRequests().map { "\($0.method) \($0.path)" }
+    #expect(methodPaths.contains("DELETE /webhooks/wh-leftover"))
+    #expect(methodPaths.contains("DELETE /webhooks/wh-other-stale"))
+    #expect(methodPaths.filter { $0.hasPrefix("POST") }.count == 1)
+    #expect(mockConfig["webhook_id"] == "wh-init-fresh")
+    #expect(mockConfig["signing_secret"] == "whsec_init_fresh")
+    #expect(mockConfig["webhook_registered"] == "true")
+  }
+
+  @Test("initPlugin is a no-op when api_key or tunnel_url is missing")
+  func initNoopWhenIncomplete() {
+    MockHost.setUp()
+    mockConfig["api_key"] = "re_test"
+    // No tunnel_url.
+
+    initPlugin(PluginContext())
+
+    #expect(parsedRequests().isEmpty, "Should not call Resend without tunnel_url")
+    #expect(mockConfig["webhook_registered"] == nil)
+  }
+
+  @Test("Create failure leaves webhook_registered cleared")
+  func createFailureClearsFlags() {
+    MockHost.setUp()
+    mockConfig["api_key"] = "re_test"
+
+    pushListResponse([])
+    // 422 = not retryable, so we burn one POST and stop.
+    MockHost.pushHTTPResponse(status: 422, body: ["message": "validation error"])
+
+    triggerReconcile(tunnelURL: "https://tunnel.example.com")
+
+    #expect(mockConfig["webhook_id"] == nil)
+    #expect(mockConfig["signing_secret"] == nil)
+    #expect(mockConfig["webhook_registered"] == nil)
   }
 }

@@ -265,6 +265,13 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
               "methods": ["GET"],
               "description": "Health check",
               "auth": "owner"
+            },
+            {
+              "id": "reset_webhook",
+              "path": "/reset_webhook",
+              "methods": ["POST"],
+              "description": "Wipe all plugin webhooks on the Resend account and re-register a single fresh webhook with the current tunnel URL.",
+              "auth": "owner"
             }
           ],
           "config": {
