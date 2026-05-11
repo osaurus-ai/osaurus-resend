@@ -199,6 +199,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
             },
             {
               "id": "resend_list_threads",
+              "widget": true,
               "description": "List email conversation threads. Returns thread summaries (subject, participants, labels, last message preview). Use this to find threads by participant email or label, or to see recent conversations. For full message content, follow up with resend_get_thread.",
               "parameters": {
                 "type": "object",
