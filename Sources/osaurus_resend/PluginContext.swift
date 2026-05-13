@@ -28,20 +28,11 @@ func initPlugin(_ ctx: PluginContext) {
   logDebug("initPlugin: starting")
   DatabaseManager.initSchema()
 
-  // Restore the tunnel URL into the in-memory ctx if a previous run persisted
-  // it via host config; this lets the auto-reconcile below run without waiting
-  // for an `onConfigChanged("tunnel_url", ...)` event after a restart.
+  // Pure DB + state restore. Reconciliation lives in `onConfigChanged`: init
+  // runs without an active agent context, and the host force-redelivers
+  // `tunnel_url` post-init (and on every tunnel reconnect) anyway.
   ctx.tunnelURL = configGet("tunnel_url")
-
-  // Always reconcile on init: wipe every webhook of ours on the account and
-  // register a fresh one. Guarantees exactly one active webhook after every
-  // plugin start, even after crashes or restarts mid-config-change.
-  let result = reconcileWebhook(ctx: ctx)
-  if result.ok {
-    logInfo("initPlugin: ready (webhook id=\(result.webhookId ?? "?"))")
-  } else {
-    logInfo("initPlugin: ready (webhook not configured: \(result.error ?? "unknown"))")
-  }
+  logInfo("initPlugin: ready (waiting for config push)")
 }
 
 func destroyPlugin(_ ctx: PluginContext) {
@@ -55,6 +46,10 @@ func destroyPlugin(_ ctx: PluginContext) {
 }
 
 func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
+  // v6 ABI mirror probe: explicit opt-out keeps the rest of this function
+  // off the host's pre-flight handshake hot path.
+  if key == "__osaurus_abi_probe__" { return }
+
   logDebug("onConfigChanged: key=\(key) hasValue=\(value != nil)")
 
   switch key {
@@ -63,9 +58,9 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
     reconcileWebhook(ctx: ctx)
 
   case "api_key":
-    // The webhook_id we have on file belongs to whatever account the previous
-    // key referenced; drop it so reconcile starts clean against the new key.
-    // (We can't delete the old account's webhook -- we no longer have its key.)
+    // Stored webhook_id belongs to the previous account, drop it so
+    // reconcile starts clean. (We can't delete the old account's webhook
+    // anymore — we no longer have its key.)
     clearWebhookConfig()
     reconcileWebhook(ctx: ctx)
 
@@ -83,56 +78,49 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
 // MARK: - Webhook Reconciliation (single entry point)
 
 /// Single, idempotent entry point that ensures exactly one Resend webhook
-/// exists for our plugin endpoint.
+/// exists for our plugin endpoint. "Nuke-and-create" strategy: list, delete
+/// every entry matching our suffix, then create one fresh webhook with the
+/// current `tunnel_url` and the full lifecycle event set.
 ///
-/// Strategy ("nuke-and-create"):
-/// 1. List every webhook on the account (paginated).
-/// 2. Delete every entry whose endpoint matches our suffix.
-/// 3. Create one fresh webhook with the current `tunnel_url` and the full
-///    lifecycle event set.
+/// Trade-off vs. PATCH/adopt: eliminates duplicate-trigger bugs (multiple
+/// webhooks firing per email), sidesteps Resend's 500 on duplicate-URL POSTs,
+/// and refreshes the `signing_secret` on every reconcile so stale secrets
+/// self-heal.
 ///
-/// Why not a PATCH/adopt reconcile:
-/// - Eliminates the duplicate-trigger class of bug (multiple webhooks firing
-///   per inbound email).
-/// - Sidesteps Resend's 500 on duplicate-URL POSTs by always freeing the URL
-///   first.
-/// - Refreshes the `signing_secret` on every reconcile, so stale secrets
-///   self-heal whenever the user rotates anything.
-///
-/// Returns a tri-tuple so callers (init, config-change, manual reset route)
-/// can react uniformly. A missing api_key or tunnel_url is *not* an error;
-/// it's just a no-op until both are configured.
+/// A missing `api_key` or `tunnel_url` is not an error; it's a no-op until
+/// both are configured.
 @discardableResult
 func reconcileWebhook(ctx: PluginContext) -> (ok: Bool, webhookId: String?, error: String?) {
-  guard let apiKey = configGet("api_key"), !apiKey.isEmpty else {
+  func fail(_ reason: String) -> (ok: Bool, webhookId: String?, error: String?) {
     clearWebhookConfig()
-    return (false, nil, "api_key not configured")
+    return (false, nil, reason)
+  }
+
+  guard let apiKey = configGet("api_key"), !apiKey.isEmpty else {
+    return fail("api_key not configured")
   }
   guard let tunnelURL = ctx.tunnelURL ?? configGet("tunnel_url"), !tunnelURL.isEmpty else {
-    clearWebhookConfig()
-    return (false, nil, "tunnel_url not configured")
+    return fail("tunnel_url not configured")
   }
 
   let desiredURL = "\(tunnelURL)\(webhookEndpointSuffix)"
   logDebug("reconcileWebhook: desiredURL=\(desiredURL)")
 
   guard wipeOurWebhooks(apiKey: apiKey) else {
-    clearWebhookConfig()
-    return (false, nil, "failed to list existing webhooks")
+    return fail("failed to list existing webhooks")
   }
 
   let (webhookId, signingSecret) = resendCreateWebhook(apiKey: apiKey, endpoint: desiredURL)
   guard let webhookId else {
-    clearWebhookConfig()
-    return (false, nil, "failed to register webhook")
+    return fail("failed to register webhook")
   }
 
   configSet("webhook_id", webhookId)
   if let signingSecret {
     configSet("signing_secret", signingSecret)
   } else {
-    // Resend should always hand back a secret on create; if it doesn't,
-    // signature verification can't engage. Log loudly and clear any stale value.
+    // Resend should always return a secret on create; without one, signature
+    // verification can't engage. Log loudly and clear any stale value.
     logWarn("reconcileWebhook: webhook \(webhookId) created but no signing_secret returned")
     configDelete("signing_secret")
   }

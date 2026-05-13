@@ -71,7 +71,7 @@ func resendRequest(
     "headers": [
       "Authorization": "Bearer \(apiKey)",
       "Content-Type": "application/json",
-      "User-Agent": "osaurus-resend/0.1.0",
+      "User-Agent": "osaurus-resend/0.2.0",
     ],
     "timeout_ms": 15000,
   ]
@@ -92,11 +92,7 @@ func resendRequest(
   var attempt = 0
   while true {
     awaitRateLimitSlot()
-    let responseStr: String? = requestJSON.withCString { ptr in
-      guard let responsePtr = httpRequest(ptr) else { return nil }
-      return String(cString: responsePtr)
-    }
-    guard let responseStr else {
+    guard let responseStr = callHostString(requestJSON, via: httpRequest) else {
       logError("No response from http_request for \(method) \(path)")
       return (false, nil)
     }

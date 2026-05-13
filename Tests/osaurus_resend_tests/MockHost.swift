@@ -34,6 +34,7 @@ nonisolated(unsafe) var mockSuppressedAddresses: [String: (reason: String, creat
 nonisolated(unsafe) var mockEmailEvents: [(emailId: String, type: String, detail: String?)] = []
 nonisolated(unsafe) var mockSvixIds: Set<String> = []
 nonisolated(unsafe) var mockAddIssueCalls: [(taskId: String, payload: String)] = []
+nonisolated(unsafe) var mockDispatchInterruptCalls: [(taskId: String, message: String)] = []
 
 enum MockHost {
   static func setUp() {
@@ -52,6 +53,7 @@ enum MockHost {
       mockEmailEvents = []
       mockSvixIds = []
       mockAddIssueCalls = []
+      mockDispatchInterruptCalls = []
 
       // Make the resend retry/backoff loop instantaneous in tests so 429/5xx
       // exploration doesn't sleep for seconds.
@@ -72,6 +74,7 @@ enum MockHost {
       mockHostAPIStorage.dispatch = mockDispatch
       mockHostAPIStorage.file_read = mockFileRead
       mockHostAPIStorage.dispatch_add_issue = mockDispatchAddIssue
+      mockHostAPIStorage.dispatch_interrupt = mockDispatchInterrupt
 
       withUnsafePointer(to: &mockHostAPIStorage) { ptr in
         hostAPI = ptr
@@ -201,6 +204,13 @@ private let mockDispatchAddIssue: osr_dispatch_add_issue_fn = { taskPtr, payload
   let payload = String(cString: payloadPtr)
   withMockLock { mockAddIssueCalls.append((taskId: taskId, payload: payload)) }
   return mockStr("{\"ok\":true}")
+}
+
+private let mockDispatchInterrupt: osr_dispatch_interrupt_fn = { taskPtr, msgPtr in
+  guard let taskPtr else { return }
+  let taskId = String(cString: taskPtr)
+  let message = msgPtr.map { String(cString: $0) } ?? ""
+  withMockLock { mockDispatchInterruptCalls.append((taskId: taskId, message: message)) }
 }
 
 // MARK: - Mock DB

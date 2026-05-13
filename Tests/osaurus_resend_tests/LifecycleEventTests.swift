@@ -95,8 +95,8 @@ struct LifecycleEventTests {
     #expect(mockHTTPRequests.isEmpty)
   }
 
-  @Test("Send-failure event surfaces an issue into the running task")
-  func failureSurfacesToTask() {
+  @Test("Send-failure event interrupts the running task with a system message")
+  func failureInterruptsRunningTask() {
     MockHost.setUp()
     DatabaseManager.initSchema()
     seedOutboundMessage(threadId: "t-3", emailId: "e-fail", taskId: "task-running")
@@ -107,12 +107,16 @@ struct LifecycleEventTests {
     let status = sendWebhook(body: body)
     #expect(status == 200)
 
-    #expect(mockAddIssueCalls.count == 1)
-    if let call = mockAddIssueCalls.first {
+    // The legacy `dispatch_add_issue` slot is RESERVED on v6 hosts and now
+    // returns `not_supported`. We replaced it with `dispatch_interrupt`, which
+    // appends the failure context as a user-role turn into the live session
+    // and cancels the current stream so the agent re-decides on the next round.
+    #expect(mockAddIssueCalls.isEmpty)
+    #expect(mockDispatchInterruptCalls.count == 1)
+    if let call = mockDispatchInterruptCalls.first {
       #expect(call.taskId == "task-running")
-      #expect(call.payload.contains("email_send_problem"))
-      #expect(call.payload.contains("domain not verified"))
-      #expect(call.payload.contains("e-fail"))
+      #expect(call.message.contains("[email-system]"))
+      #expect(call.message.contains("domain not verified"))
     }
   }
 
@@ -130,6 +134,7 @@ struct LifecycleEventTests {
 
     #expect(mockEmailEvents.contains { $0.type == "delivered" && $0.emailId == "e-delivered" })
     #expect(mockAddIssueCalls.isEmpty)
+    #expect(mockDispatchInterruptCalls.isEmpty)
     #expect(DatabaseManager.getSuppression(address: "bob@example.com") == nil)
   }
 

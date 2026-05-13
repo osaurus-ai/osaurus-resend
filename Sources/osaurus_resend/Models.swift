@@ -91,6 +91,16 @@ struct TaskCompletedEvent: Decodable {
   let title: String?
 }
 
+/// Payload of `OSR_TASK_EVENT_CLARIFICATION`. The host fires this when the
+/// agent calls the inline `clarify` tool and parses the call into a structured
+/// question. `options` is OMITTED entirely (not an empty array) for free-form
+/// questions, so its presence is a clean "free-form vs choice" discriminator.
+struct TaskClarificationEvent: Decodable {
+  let question: String?
+  let options: [String]?
+  let allow_multiple: Bool?
+}
+
 // MARK: - Artifact Payload
 
 struct ArtifactPayload: Decodable {

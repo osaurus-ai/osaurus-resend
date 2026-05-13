@@ -167,28 +167,36 @@ private func extractFailureReason(_ body: String) -> String? {
   return payload["reason"] as? String
 }
 
-/// When a send-related lifecycle event arrives for an email that belongs to a
-/// thread with an active task, push the failure into the running task as an
-/// issue so the agent can adapt mid-flight instead of finding out later.
+/// Pushes a send-related failure into the live task as a user-role turn so
+/// the agent re-decides on the next round (the legacy `dispatch_add_issue`
+/// slot is RESERVED on v6 hosts and returns `not_supported`).
 private func surfaceFailureToTask(emailId: String, summary: String) {
   guard let thread = DatabaseManager.getThreadByOutboundEmailId(emailId),
-    let taskId = thread.taskId, !taskId.isEmpty,
-    let addIssue = hostAPI?.pointee.dispatch_add_issue
+    let taskId = thread.taskId, !taskId.isEmpty
   else { return }
 
-  let issuePayload: [String: Any] = [
-    "kind": "email_send_problem",
-    "summary": summary,
-    "email_id": emailId,
-    "thread_id": thread.threadId,
-  ]
-  guard let issueJSON = makeJSONString(issuePayload) else { return }
+  let message =
+    "[email-system] \(summary) Adjust your plan: try a different recipient, "
+    + "fix the address, or stop trying to email this destination."
+  if dispatchInterrupt(taskId: taskId, message: message) {
+    logDebug("surfaceFailureToTask: interrupted task=\(taskId) email_id=\(emailId)")
+  }
+}
+
+/// Wraps the C-string juggling around `host->dispatch_interrupt`. Returns
+/// `true` when the call was actually dispatched. No-op on hosts older than
+/// the slot's introduction (and on empty `taskId`).
+@discardableResult
+private func dispatchInterrupt(taskId: String, message: String) -> Bool {
+  guard !taskId.isEmpty, let interrupt = hostAPI?.pointee.dispatch_interrupt else {
+    return false
+  }
   taskId.withCString { taskPtr in
-    issueJSON.withCString { jsonPtr in
-      _ = addIssue(taskPtr, jsonPtr)
+    message.withCString { msgPtr in
+      interrupt(taskPtr, msgPtr)
     }
   }
-  logDebug("surfaceFailureToTask: pushed issue for task=\(taskId) email_id=\(emailId)")
+  return true
 }
 
 // MARK: - Inbound Email Processing
@@ -302,12 +310,39 @@ private func upsertThreadForInbound(parsed: ParsedInboundEmail) -> String {
   return threadId
 }
 
+/// Reply tools we want the model to see on turn 1 of every inbound dispatch.
+/// Pinning closes the gap where auto-mode preflight occasionally misses them.
+/// Names not in this plugin's manifest would be silently dropped by the host.
+private let pinnedReplyTools = [
+  "resend_reply",
+  "resend_get_thread",
+  "resend_label_thread",
+]
+
 private func dispatchInboundTask(
   ctx: PluginContext, parsed: ParsedInboundEmail, threadId: String, agentAddress: String?
 ) {
   guard let dispatch = hostAPI?.pointee.dispatch else {
     logError("processInboundEmail: dispatch not available")
     return
+  }
+
+  // Follow-up email on a thread with an in-flight task: inject the new body
+  // into the live session and cancel the current stream, then dispatch fresh
+  // with the same session_id. The reattach merges full context so the model
+  // produces one coherent reply instead of two racing parallel agents.
+  if let activeTask = DatabaseManager.getThread(threadId: threadId)?.taskId,
+    !activeTask.isEmpty
+  {
+    let interruptText =
+      "[follow-up email arrived in this thread, from \(parsed.fromAddress)]\n\n"
+      + (parsed.bodyText ?? parsed.bodyHtml ?? "(empty body)")
+    if dispatchInterrupt(taskId: activeTask, message: interruptText) {
+      DatabaseManager.clearTaskId(threadId: threadId)
+      clearTaskState(ctx: ctx, taskId: activeTask)
+      logInfo(
+        "dispatchInboundTask: interrupted in-flight task \(activeTask) on thread \(threadId)")
+    }
   }
 
   let prompt = buildEmailPrompt(
@@ -318,7 +353,11 @@ private func dispatchInboundTask(
   var payload: [String: Any] = [
     "prompt": prompt,
     "title": "Email: \(String(titleSource.prefix(60)))",
-    "external_session_key": "resend:thread:\(threadId)",
+    // Reattaches every email on the same thread to one continuous Osaurus
+    // session. Replaces `external_session_key`, which is not in the dispatch
+    // schema and was being silently dropped by the host.
+    "session_id": sessionId(forThreadId: threadId),
+    "tools": pinnedReplyTools,
   ]
   if let agentAddress { payload["agent_address"] = agentAddress }
 
@@ -327,11 +366,7 @@ private func dispatchInboundTask(
     return
   }
 
-  let resultStr: String? = payloadJSON.withCString { ptr in
-    guard let p = dispatch(ptr) else { return nil }
-    return String(cString: p)
-  }
-  guard let resultStr,
+  guard let resultStr = callHostString(payloadJSON, via: dispatch),
     let result = parseJSON(resultStr, as: DispatchResponse.self),
     let taskId = result.id
   else {
@@ -416,6 +451,8 @@ private func buildEmailPrompt(
 
 func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, eventJSON: String) {
   switch eventType {
+  case OSR_TASK_EVENT_CLARIFICATION:
+    handleTaskClarification(ctx: ctx, taskId: taskId, eventJSON: eventJSON)
   case OSR_TASK_EVENT_COMPLETED:
     handleTaskCompleted(ctx: ctx, taskId: taskId, eventJSON: eventJSON)
   case OSR_TASK_EVENT_FAILED, OSR_TASK_EVENT_CANCELLED:
@@ -423,6 +460,50 @@ func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, event
   default:
     break
   }
+}
+
+/// Forwards a paused agent's clarify question to the email channel. Without
+/// this branch the user would see nothing: the host suppresses COMPLETED for
+/// the duration of a clarify pause and the question text only ever lives in
+/// this event's payload.
+///
+/// `task_id` deliberately survives the pause; the same task resumes when the
+/// user replies and the webhook arrives, at which point `dispatchInboundTask`'s
+/// in-flight check interrupts the paused task with the user's response.
+/// Recording the question as outbound keeps the COMPLETED safety-net auto-reply
+/// disarmed when the resumed run terminates.
+private func handleTaskClarification(
+  ctx: PluginContext, taskId: String, eventJSON: String
+) {
+  guard let event = parseJSON(eventJSON, as: TaskClarificationEvent.self),
+    let question = event.question, !question.isEmpty
+  else {
+    logDebug("handleTaskClarification: empty/invalid payload, skipping")
+    return
+  }
+  guard let thread = DatabaseManager.getThreadByTaskId(taskId) else {
+    logDebug("handleTaskClarification: no thread for task \(taskId)")
+    return
+  }
+
+  let html = renderClarificationBody(event: event, question: question)
+  let logCtx = "handleTaskClarification (task \(taskId), thread \(thread.threadId))"
+  if sendAndRecordReply(thread: thread, html: html, logContext: logCtx) {
+    logInfo("\(logCtx): forwarded question")
+  }
+}
+
+private func renderClarificationBody(
+  event: TaskClarificationEvent, question: String
+) -> String {
+  guard let options = event.options, !options.isEmpty else { return question }
+  let bullets = options.enumerated()
+    .map { i, opt in "\(i + 1). \(opt)" }
+    .joined(separator: "<br/>")
+  let multiNote =
+    (event.allow_multiple == true)
+    ? "<br/><br/><i>(multiple selections allowed)</i>" : ""
+  return "\(question)<br/><br/>\(bullets)\(multiNote)"
 }
 
 private func handleTaskCompleted(ctx: PluginContext, taskId: String, eventJSON: String) {
@@ -452,29 +533,60 @@ private func handleTaskCompleted(ctx: PluginContext, taskId: String, eventJSON: 
     return
   }
 
+  let attachments = collectAndClearArtifacts(taskId: taskId, ctx: ctx)
+  let logCtx = "handleTaskCompleted (task \(taskId), thread \(thread.threadId))"
+  if sendAndRecordReply(
+    thread: thread, html: summary, attachments: attachments, logContext: logCtx)
+  {
+    logInfo("Auto-replied in thread \(thread.threadId) with \(attachments.count) attachments")
+  }
+}
+
+private func handleTaskFailed(ctx: PluginContext, taskId: String) {
+  defer { clearTaskState(ctx: ctx, taskId: taskId) }
+  if let thread = DatabaseManager.getThreadByTaskId(taskId) {
+    DatabaseManager.clearTaskId(threadId: thread.threadId)
+    logInfo("Task \(taskId) failed/cancelled, no email sent")
+  }
+}
+
+/// Sends an HTML email as a reply on `thread`, performing the standard pre-
+/// flight (config check, recipient resolution, suppression check) and on
+/// success records a corresponding outbound row so `hasOutboundMessageSince`
+/// reflects the send (which is what disarms the COMPLETED safety net).
+///
+/// Returns `true` only when the email was actually accepted by Resend and the
+/// outbound row was inserted; all failure modes are logged with `logContext`
+/// as the prefix and return `false` so callers can short-circuit cleanly.
+@discardableResult
+private func sendAndRecordReply(
+  thread: ThreadRow,
+  html: String,
+  attachments: [EmailAttachment] = [],
+  logContext: String
+) -> Bool {
   guard let apiKey = configGet("api_key"), !apiKey.isEmpty,
     let fromEmail = configGet("from_email"), !fromEmail.isEmpty
   else {
-    logWarn("handleTaskCompleted: missing config, cannot auto-reply")
-    return
+    logWarn("\(logContext): missing config, cannot reply")
+    return false
   }
   guard
     let recipients = computeReplyRecipients(
       thread: thread, fromEmail: fromEmail, explicitTo: nil)
   else {
-    logWarn("handleTaskCompleted: no recipients for auto-reply")
-    return
+    logWarn("\(logContext): no recipients on thread")
+    return false
   }
   if let blocked = checkSuppressed(recipients.to + recipients.cc) {
-    logWarn("handleTaskCompleted: skipping auto-reply, recipient suppressed (\(blocked))")
-    return
+    logWarn("\(logContext): skipping, recipient suppressed (\(blocked))")
+    return false
   }
 
-  let attachments = collectAndClearArtifacts(taskId: taskId, ctx: ctx)
   let params = SendEmailParams(
     from: formatFromAddress(name: configGet("from_name"), email: fromEmail),
     to: recipients.to, subject: buildReplySubject(thread.subject),
-    html: summary, text: nil,
+    html: html, text: nil,
     cc: recipients.cc.isEmpty ? nil : recipients.cc, bcc: nil,
     replyTo: [fromEmail],
     headers: emptyToNil(
@@ -485,26 +597,19 @@ private func handleTaskCompleted(ctx: PluginContext, taskId: String, eventJSON: 
 
   let (emailId, error) = resendSendEmail(apiKey: apiKey, params: params)
   guard let emailId else {
-    logError("handleTaskCompleted: auto-reply failed: \(error ?? "unknown")")
-    return
+    logError("\(logContext): send failed: \(error ?? "unknown")")
+    return false
   }
 
   DatabaseManager.insertMessage(
     threadId: thread.threadId, emailId: emailId, direction: "out",
-    fromAddress: fromEmail, toAddress: recipients.to, ccAddress: recipients.cc, bccAddress: [],
-    subject: params.subject, bodyText: nil, bodyHtml: summary,
+    fromAddress: fromEmail, toAddress: recipients.to,
+    ccAddress: recipients.cc, bccAddress: [],
+    subject: params.subject, bodyText: nil, bodyHtml: html,
     messageId: nil, inReplyTo: thread.lastMessageId,
     hasAttachments: !attachments.isEmpty
   )
-  logInfo("Auto-replied in thread \(thread.threadId) with \(attachments.count) attachments")
-}
-
-private func handleTaskFailed(ctx: PluginContext, taskId: String) {
-  defer { clearTaskState(ctx: ctx, taskId: taskId) }
-  if let thread = DatabaseManager.getThreadByTaskId(taskId) {
-    DatabaseManager.clearTaskId(threadId: thread.threadId)
-    logInfo("Task \(taskId) failed/cancelled, no email sent")
-  }
+  return true
 }
 
 private func clearTaskState(ctx: PluginContext, taskId: String) {

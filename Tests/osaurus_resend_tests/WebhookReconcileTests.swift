@@ -254,18 +254,41 @@ struct WebhookReconcileTests {
     #expect(mockConfig["signing_secret"] == "whsec_2")
   }
 
-  @Test("initPlugin auto-reconciles when api_key + tunnel_url are already configured")
-  func initAutoReconciles() {
+  @Test("initPlugin does not call Resend; reconcile fires from on_config_changed")
+  func initIsPureRestoreOnly() {
     MockHost.setUp()
-    // Persisted config from a previous run.
+    // Persisted config from a previous run, including a valid tunnel URL
+    // and a stale webhook id we want wiped on the next reconcile.
     mockConfig["api_key"] = "re_test"
     mockConfig["tunnel_url"] = "https://tunnel.example.com"
     mockConfig["webhook_id"] = "wh-leftover"
     mockConfig["signing_secret"] = "whsec_old"
     mockConfig["webhook_registered"] = "true"
 
-    // Resend currently has two stale webhooks of ours. Init must wipe both
-    // before creating a single fresh one, regardless of any local config.
+    // init alone runs without an active agent on the calling thread, so we
+    // deliberately do NOT touch Resend here — the host will force-redeliver
+    // tunnel_url through on_config_changed once the agent context is bound.
+    let ctx = PluginContext()
+    initPlugin(ctx)
+
+    #expect(parsedRequests().isEmpty, "init must not make any Resend HTTP calls")
+    // Stale config is left intact; reconcile is what would clean it up.
+    #expect(mockConfig["webhook_id"] == "wh-leftover")
+    // But ctx is rehydrated from persisted state so the next reconcile has
+    // the URL to work with without waiting for the host's first push.
+    #expect(ctx.tunnelURL == "https://tunnel.example.com")
+  }
+
+  @Test("Host config push after init triggers reconcile and wipes stale webhooks")
+  func postInitConfigPushReconciles() {
+    MockHost.setUp()
+    // Same persisted state as the previous test.
+    mockConfig["api_key"] = "re_test"
+    mockConfig["tunnel_url"] = "https://tunnel.example.com"
+    mockConfig["webhook_id"] = "wh-leftover"
+    mockConfig["signing_secret"] = "whsec_old"
+    mockConfig["webhook_registered"] = "true"
+
     let oursURL = "https://tunnel.example.com/plugins/osaurus.resend/webhook"
     pushListResponse([
       (id: "wh-leftover", endpoint: oursURL),
@@ -275,7 +298,12 @@ struct WebhookReconcileTests {
     pushDeleteOkResponse()
     pushCreateOkResponse(id: "wh-init-fresh", secret: "whsec_init_fresh")
 
-    initPlugin(PluginContext())
+    let ctx = PluginContext()
+    initPlugin(ctx)
+
+    // Host force-redelivers tunnel_url after init / on every relay reconnect;
+    // that re-fires on_config_changed which is where reconcile lives now.
+    onConfigChanged(ctx: ctx, key: "tunnel_url", value: "https://tunnel.example.com")
 
     let methodPaths = parsedRequests().map { "\($0.method) \($0.path)" }
     #expect(methodPaths.contains("DELETE /webhooks/wh-leftover"))
@@ -286,16 +314,16 @@ struct WebhookReconcileTests {
     #expect(mockConfig["webhook_registered"] == "true")
   }
 
-  @Test("initPlugin is a no-op when api_key or tunnel_url is missing")
-  func initNoopWhenIncomplete() {
+  @Test("ABI probe on_config_changed key is ignored")
+  func abiProbeIsNoop() {
     MockHost.setUp()
     mockConfig["api_key"] = "re_test"
-    // No tunnel_url.
 
-    initPlugin(PluginContext())
+    let ctx = PluginContext()
+    onConfigChanged(ctx: ctx, key: "__osaurus_abi_probe__", value: UUID().uuidString)
 
-    #expect(parsedRequests().isEmpty, "Should not call Resend without tunnel_url")
-    #expect(mockConfig["webhook_registered"] == nil)
+    #expect(parsedRequests().isEmpty)
+    #expect(ctx.tunnelURL == nil)
   }
 
   @Test("Create failure leaves webhook_registered cleared")

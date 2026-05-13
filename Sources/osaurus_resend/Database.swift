@@ -1,5 +1,23 @@
 import Foundation
 
+/// Column list used by every `SELECT ... FROM threads` query in this file.
+/// Kept in lock-step with `threadRowFromArray`'s positional decode (9 cols).
+private let threadColumns =
+  "thread_id, subject, participants, last_message_id, refs, task_id, labels, created_at, updated_at"
+
+/// Column list used by every `SELECT ... FROM messages` query in this file.
+/// Kept in lock-step with `messageRowFromArray`'s positional decode (15 cols).
+private let messageColumns = """
+  id, thread_id, email_id, direction, from_address, to_address, cc_address, bcc_address, \
+  subject, body_text, body_html, message_id, in_reply_to, has_attachments, created_at
+  """
+
+/// `threadColumns` requalified with the `t.` alias for use inside JOINs.
+private let qualifiedThreadColumns: String = threadColumns
+  .split(separator: ",")
+  .map { "t.\($0.trimmingCharacters(in: .whitespaces))" }
+  .joined(separator: ", ")
+
 enum DatabaseManager {
 
   // MARK: - Schema
@@ -67,6 +85,10 @@ enum DatabaseManager {
       "CREATE INDEX IF NOT EXISTS idx_messages_email_id ON messages(email_id)",
       "CREATE INDEX IF NOT EXISTS idx_threads_updated ON threads(updated_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_email_events_email ON email_events(email_id, created_at DESC)",
+      // At most one in-flight task per thread (messaging-pattern invariant 2).
+      // Partial index lets multiple threads with NULL task_id coexist; the
+      // constraint only kicks in when a thread actually has an active task.
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_threads_task_id ON threads(task_id) WHERE task_id IS NOT NULL",
     ]
     for sql in statements {
       dbExec(sql, params: "[]")
@@ -97,38 +119,26 @@ enum DatabaseManager {
   }
 
   static func getThread(threadId: String) -> ThreadRow? {
-    let sql =
-      "SELECT thread_id, subject, participants, last_message_id, refs, task_id, labels, created_at, updated_at FROM threads WHERE thread_id = ?1"
-    guard let resultStr = dbQuery(sql, params: serializeParams([threadId])),
-      let rows = extractRows(resultStr),
-      let row = rows.first
-    else { return nil }
-    return threadRowFromArray(row)
+    queryFirstThread(
+      "SELECT \(threadColumns) FROM threads WHERE thread_id = ?1",
+      values: [threadId])
   }
 
   static func getThreadByMessageId(_ messageId: String) -> ThreadRow? {
     let sql = """
-      SELECT t.thread_id, t.subject, t.participants, t.last_message_id, t.refs, t.task_id, t.labels, t.created_at, t.updated_at
+      SELECT \(qualifiedThreadColumns)
       FROM threads t
       JOIN messages m ON m.thread_id = t.thread_id
       WHERE m.message_id = ?1
       ORDER BY t.updated_at DESC LIMIT 1
       """
-    guard let resultStr = dbQuery(sql, params: serializeParams([messageId])),
-      let rows = extractRows(resultStr),
-      let row = rows.first
-    else { return nil }
-    return threadRowFromArray(row)
+    return queryFirstThread(sql, values: [messageId])
   }
 
   static func getThreadByTaskId(_ taskId: String) -> ThreadRow? {
-    let sql =
-      "SELECT thread_id, subject, participants, last_message_id, refs, task_id, labels, created_at, updated_at FROM threads WHERE task_id = ?1 LIMIT 1"
-    guard let resultStr = dbQuery(sql, params: serializeParams([taskId])),
-      let rows = extractRows(resultStr),
-      let row = rows.first
-    else { return nil }
-    return threadRowFromArray(row)
+    queryFirstThread(
+      "SELECT \(threadColumns) FROM threads WHERE task_id = ?1 LIMIT 1",
+      values: [taskId])
   }
 
   static func updateThread(
@@ -200,18 +210,14 @@ enum DatabaseManager {
       paramIdx += 1
     }
 
-    var sql =
-      "SELECT thread_id, subject, participants, last_message_id, refs, task_id, labels, created_at, updated_at FROM threads"
+    var sql = "SELECT \(threadColumns) FROM threads"
     if !conditions.isEmpty {
       sql += " WHERE " + conditions.joined(separator: " AND ")
     }
     sql += " ORDER BY updated_at DESC LIMIT ?\(paramIdx)"
     values.append(min(max(limit, 1), 100))
 
-    guard let resultStr = dbQuery(sql, params: serializeParams(values)),
-      let rows = extractRows(resultStr)
-    else { return [] }
-    return rows.compactMap(threadRowFromArray)
+    return queryRows(sql, values: values).compactMap(threadRowFromArray)
   }
 
   // MARK: - Messages
@@ -245,31 +251,20 @@ enum DatabaseManager {
   }
 
   static func getMessages(threadId: String, limit: Int = 20) -> [MessageRow] {
-    let clampedLimit = min(max(limit, 1), 200)
     let sql = """
-      SELECT id, thread_id, email_id, direction, from_address, to_address, cc_address, bcc_address,
-             subject, body_text, body_html, message_id, in_reply_to, has_attachments, created_at
-      FROM messages WHERE thread_id = ?1
+      SELECT \(messageColumns) FROM messages WHERE thread_id = ?1
       ORDER BY created_at DESC LIMIT ?2
       """
-    guard let resultStr = dbQuery(sql, params: serializeParams([threadId, clampedLimit])),
-      let rows = extractRows(resultStr)
-    else { return [] }
-    return rows.compactMap(messageRowFromArray)
+    let clampedLimit = min(max(limit, 1), 200)
+    return queryRows(sql, values: [threadId, clampedLimit]).compactMap(messageRowFromArray)
   }
 
   static func getLastInboundMessage(threadId: String) -> MessageRow? {
     let sql = """
-      SELECT id, thread_id, email_id, direction, from_address, to_address, cc_address, bcc_address,
-             subject, body_text, body_html, message_id, in_reply_to, has_attachments, created_at
-      FROM messages WHERE thread_id = ?1 AND direction = 'in'
+      SELECT \(messageColumns) FROM messages WHERE thread_id = ?1 AND direction = 'in'
       ORDER BY created_at DESC LIMIT 1
       """
-    guard let resultStr = dbQuery(sql, params: serializeParams([threadId])),
-      let rows = extractRows(resultStr),
-      let row = rows.first
-    else { return nil }
-    return messageRowFromArray(row)
+    return queryFirstRow(sql, values: [threadId]).flatMap(messageRowFromArray)
   }
 
   static func hasOutboundMessageSince(threadId: String, sinceTimestamp: Int) -> Bool {
@@ -277,19 +272,12 @@ enum DatabaseManager {
       SELECT COUNT(*) FROM messages
       WHERE thread_id = ?1 AND direction = 'out' AND created_at >= ?2
       """
-    guard let resultStr = dbQuery(sql, params: serializeParams([threadId, sinceTimestamp])),
-      let rows = extractRows(resultStr),
-      let row = rows.first,
-      let count = row.first as? Int
-    else { return false }
-    return count > 0
+    return queryScalarInt(sql, values: [threadId, sinceTimestamp]) > 0
   }
 
   static func getLastMessagePreview(threadId: String) -> String? {
     let sql = "SELECT body_text FROM messages WHERE thread_id = ?1 ORDER BY created_at DESC LIMIT 1"
-    guard let resultStr = dbQuery(sql, params: serializeParams([threadId])),
-      let rows = extractRows(resultStr),
-      let row = rows.first,
+    guard let row = queryFirstRow(sql, values: [threadId]),
       let text = row.first as? String
     else { return nil }
     return String(text.prefix(200))
@@ -298,41 +286,23 @@ enum DatabaseManager {
   // MARK: - Authorization Queries
 
   static func hasSentTo(address: String) -> Bool {
-    let cleaned = address.lowercased()
     let sql = """
       SELECT COUNT(*) FROM messages
       WHERE direction = 'out' AND LOWER(to_address) LIKE ?1
       """
-    guard let resultStr = dbQuery(sql, params: serializeParams(["%\(cleaned)%"])),
-      let rows = extractRows(resultStr),
-      let row = rows.first,
-      let count = row.first as? Int
-    else { return false }
-    return count > 0
+    return queryScalarInt(sql, values: ["%\(address.lowercased())%"]) > 0
   }
 
   static func hasEmailId(_ emailId: String) -> Bool {
-    let sql = "SELECT COUNT(*) FROM messages WHERE email_id = ?1"
-    guard let resultStr = dbQuery(sql, params: serializeParams([emailId])),
-      let rows = extractRows(resultStr),
-      let row = rows.first,
-      let count = row.first as? Int
-    else { return false }
-    return count > 0
+    queryScalarInt(
+      "SELECT COUNT(*) FROM messages WHERE email_id = ?1",
+      values: [emailId]) > 0
   }
 
   static func isParticipantInAnyThread(address: String) -> Bool {
-    let cleaned = address.lowercased()
-    let sql = """
-      SELECT COUNT(*) FROM threads
-      WHERE LOWER(participants) LIKE ?1
-      """
-    guard let resultStr = dbQuery(sql, params: serializeParams(["%\(cleaned)%"])),
-      let rows = extractRows(resultStr),
-      let row = rows.first,
-      let count = row.first as? Int
-    else { return false }
-    return count > 0
+    queryScalarInt(
+      "SELECT COUNT(*) FROM threads WHERE LOWER(participants) LIKE ?1",
+      values: ["%\(address.lowercased())%"]) > 0
   }
 
   // MARK: - Outbound Lookup
@@ -341,17 +311,13 @@ enum DatabaseManager {
   /// Used by lifecycle handlers to associate bounce/failure events with a thread/task.
   static func getThreadByOutboundEmailId(_ emailId: String) -> ThreadRow? {
     let sql = """
-      SELECT t.thread_id, t.subject, t.participants, t.last_message_id, t.refs, t.task_id, t.labels, t.created_at, t.updated_at
+      SELECT \(qualifiedThreadColumns)
       FROM threads t
       JOIN messages m ON m.thread_id = t.thread_id
       WHERE m.email_id = ?1 AND m.direction = 'out'
       ORDER BY t.updated_at DESC LIMIT 1
       """
-    guard let resultStr = dbQuery(sql, params: serializeParams([emailId])),
-      let rows = extractRows(resultStr),
-      let row = rows.first
-    else { return nil }
-    return threadRowFromArray(row)
+    return queryFirstThread(sql, values: [emailId])
   }
 
   // MARK: - Suppression List
@@ -374,21 +340,14 @@ enum DatabaseManager {
 
   /// Returns the suppression reason if the address is suppressed, else `nil`.
   static func getSuppression(address: String) -> String? {
-    let cleaned = address.lowercased()
     let sql = "SELECT reason, created_at FROM suppressed_addresses WHERE address = ?1 LIMIT 1"
-    guard let resultStr = dbQuery(sql, params: serializeParams([cleaned])),
-      let rows = extractRows(resultStr),
-      let row = rows.first
-    else { return nil }
+    guard let row = queryFirstRow(sql, values: [address.lowercased()]) else { return nil }
     let reason = row.first as? String ?? "suppressed"
-    let createdAt = (row.count > 1) ? (row[1] as? Int) : nil
-    if let ts = createdAt {
-      let date = Date(timeIntervalSince1970: TimeInterval(ts))
-      let formatter = DateFormatter()
-      formatter.dateFormat = "yyyy-MM-dd"
-      return "\(reason) (\(formatter.string(from: date)))"
-    }
-    return reason
+    guard let ts = (row.count > 1) ? row[1] as? Int : nil else { return reason }
+    let date = Date(timeIntervalSince1970: TimeInterval(ts))
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd"
+    return "\(reason) (\(formatter.string(from: date)))"
   }
 
   // MARK: - Email Events Log
@@ -406,21 +365,43 @@ enum DatabaseManager {
   /// Records a Svix delivery id; returns `false` if the id has already been seen.
   /// Backed by `INSERT OR IGNORE` against a PRIMARY KEY.
   static func recordSvixId(_ svixId: String) -> Bool {
-    let countSQL = "SELECT COUNT(*) FROM processed_svix_ids WHERE svix_id = ?1"
-    if let resultStr = dbQuery(countSQL, params: serializeParams([svixId])),
-      let rows = extractRows(resultStr),
-      let row = rows.first,
-      let count = row.first as? Int,
-      count > 0
-    {
-      return false
-    }
-    let insertSQL = """
-      INSERT OR IGNORE INTO processed_svix_ids (svix_id, created_at)
-      VALUES (?1, unixepoch())
-      """
-    dbExec(insertSQL, params: serializeParams([svixId]))
+    let alreadySeen = queryScalarInt(
+      "SELECT COUNT(*) FROM processed_svix_ids WHERE svix_id = ?1",
+      values: [svixId]) > 0
+    if alreadySeen { return false }
+    dbExec(
+      "INSERT OR IGNORE INTO processed_svix_ids (svix_id, created_at) VALUES (?1, unixepoch())",
+      params: serializeParams([svixId]))
     return true
+  }
+
+  // MARK: - Query Helpers
+
+  /// Runs a query and returns all rows as positional arrays. Empty array on
+  /// any failure (transport, parse, no rows).
+  private static func queryRows(_ sql: String, values: [Any]) -> [[Any]] {
+    guard let resultStr = dbQuery(sql, params: serializeParams(values)),
+      let rows = extractRows(resultStr)
+    else { return [] }
+    return rows
+  }
+
+  /// Runs a query and returns the first row, or nil if the query returned no
+  /// rows (or failed).
+  private static func queryFirstRow(_ sql: String, values: [Any]) -> [Any]? {
+    queryRows(sql, values: values).first
+  }
+
+  /// Runs a query whose first row's first column is an `Int` (e.g. `COUNT(*)`)
+  /// and returns that integer. Returns 0 for any failure mode.
+  private static func queryScalarInt(_ sql: String, values: [Any]) -> Int {
+    queryFirstRow(sql, values: values).flatMap { $0.first as? Int } ?? 0
+  }
+
+  /// Runs a query whose row shape matches `threadColumns` and decodes the
+  /// first row into a `ThreadRow`.
+  private static func queryFirstThread(_ sql: String, values: [Any]) -> ThreadRow? {
+    queryFirstRow(sql, values: values).flatMap(threadRowFromArray)
   }
 
   // MARK: - Parsing Helpers
@@ -482,27 +463,14 @@ enum DatabaseManager {
       logError("db_exec not available")
       return
     }
-    let result = sql.withCString { sqlPtr in
-      params.withCString { paramsPtr in
-        exec(sqlPtr, paramsPtr)
-      }
-    }
-    if let result {
-      let str = String(cString: result)
-      if str.contains("\"error\"") {
-        logWarn("DB exec error: \(str)")
-      }
+    if let result = callHostString(sql, params, via: exec), result.contains("\"error\"") {
+      logWarn("DB exec error: \(result)")
     }
   }
 
   static func dbQuery(_ sql: String, params: String) -> String? {
     guard let query = hostAPI?.pointee.db_query else { return nil }
-    return sql.withCString { sqlPtr in
-      params.withCString { paramsPtr in
-        guard let resultPtr = query(sqlPtr, paramsPtr) else { return nil }
-        return String(cString: resultPtr)
-      }
-    }
+    return callHostString(sql, params, via: query)
   }
 
   static func extractRows(_ resultStr: String) -> [[Any]]? {

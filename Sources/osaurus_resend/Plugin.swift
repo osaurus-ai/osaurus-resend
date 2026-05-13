@@ -47,9 +47,22 @@ typealias osr_dispatch_interrupt_fn =
 typealias osr_dispatch_add_issue_fn =
   @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
 
+// v3+ slots
+typealias osr_complete_cancel_fn = @convention(c) (UnsafePointer<CChar>?) -> Void
+typealias osr_get_active_agent_id_fn = @convention(c) () -> UnsafePointer<CChar>?
+typealias osr_log_structured_fn =
+  @convention(c) (Int32, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
+typealias osr_host_free_string_fn = @convention(c) (UnsafePointer<CChar>?) -> Void
+
+/// Mirror of the host's `osr_host_api` C struct. Field order is FROZEN and
+/// MUST match the host layout exactly — adding, removing, or reordering any
+/// slot dispatches every later callback into the wrong host function. RESERVED
+/// slots (e.g. `dispatch_add_issue` since v6) stay wired for the same reason.
+/// See `docs/plugins/HOST_API.md` "Mirror Struct Audit" for the canonical layout.
 struct osr_host_api {
   var version: UInt32 = 0
 
+  // v1 / v2
   var config_get: osr_config_get_fn?
   var config_set: osr_config_set_fn?
   var config_delete: osr_config_delete_fn?
@@ -74,7 +87,20 @@ struct osr_host_api {
   var list_active_tasks: osr_list_active_tasks_fn?
   var send_draft: osr_send_draft_fn?
   var dispatch_interrupt: osr_dispatch_interrupt_fn?
+  /// RESERVED on v6+: returns `{"error":"not_supported"}`. Use
+  /// `dispatch_interrupt` to inject failure context into a running task.
   var dispatch_add_issue: osr_dispatch_add_issue_fn?
+
+  // v3 — streaming control
+  var complete_cancel: osr_complete_cancel_fn?
+  // v4 — agent introspection
+  var get_active_agent_id: osr_get_active_agent_id_fn?
+  // v5 — structured logging
+  var log_structured: osr_log_structured_fn?
+  // v6 — host-side free for strings the host returned. ALWAYS use this (via
+  // the `freeHostString` helper) for host-returned `const char*` instead of
+  // the plugin's own `free_string`, which is the reverse direction.
+  var free_string: osr_host_free_string_fn?
 }
 
 private typealias osr_free_string_t = @convention(c) (UnsafePointer<CChar>?) -> Void
@@ -156,13 +182,13 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
       {
         "plugin_id": "osaurus.resend",
         "name": "Resend (Email)",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "description": "Send, receive, and manage email through Resend",
-        "instructions": "You have access to email via the Resend plugin. This is asynchronous email communication, not instant messaging. Write complete, professional, self-contained responses -- the recipient may not read your reply for hours or days. Every response should be thorough enough to stand on its own without requiring immediate follow-up.\\n\\nWhen you receive an inbound email, the thread_id is provided in the prompt. Use resend_reply with that thread_id to respond. The reply is sent to all thread participants by default (reply-all). If you need to reply only to a specific person, pass the to parameter.\\n\\nTo compose a new email to someone not in the current thread, use resend_send. This creates a new thread and authorizes the recipient for future replies.\\n\\nTo review past conversations, use resend_list_threads (filterable by participant or label) for summaries, and resend_get_thread for full message bodies. Use resend_label_thread to tag threads for organization (e.g. scheduling, invoices, urgent).\\n\\nWhen producing files during a task, they are automatically attached to your next reply. You do not need to handle attachments manually.",
+        "instructions": "You have access to email via the Resend plugin. This is asynchronous email communication, not instant messaging. Write complete, professional, self-contained responses -- the recipient may not read your reply for hours or days. Every response should be thorough enough to stand on its own without requiring immediate follow-up.\\n\\nWhen you receive an inbound email, the thread_id is provided in the prompt. Use resend_reply with that thread_id to respond. The reply is sent to all thread participants by default (reply-all). If you need to reply only to a specific person, pass the to parameter.\\n\\nTo compose a new email to someone not in the current thread, use resend_send. This creates a new thread and authorizes the recipient for future replies.\\n\\nTo review past conversations, use resend_list_threads (filterable by participant or label) for summaries, and resend_get_thread for full message bodies. Use resend_label_thread to tag threads for organization (e.g. scheduling, invoices, urgent).\\n\\nIf a follow-up email arrives on the same thread while you are still working, the new message is appended to your conversation automatically and you should incorporate it into a single coherent reply rather than answering each email separately. The thread retains its full history across resumes, so feel free to call resend_get_thread when you need to refresh context.\\n\\nIf the email-system reports a send failure (e.g. bounce, suppression), reconsider the recipient and either correct the address, pick a different person, or stop trying to email that destination -- do not retry the same address.\\n\\nWhen producing files during a task, they are automatically attached to your next reply. You do not need to handle attachments manually.",
         "license": "MIT",
         "authors": [],
         "min_macos": "15.0",
-        "min_osaurus": "0.5.0",
+        "min_osaurus": "0.18.14",
         "capabilities": {
           "tools": [
             {
