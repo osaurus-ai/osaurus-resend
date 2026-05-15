@@ -206,7 +206,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
                 "required": ["to", "subject", "body"]
               },
               "requirements": [],
-              "permission_policy": "auto"
+              "permission_policy": "ask"
             },
             {
               "id": "resend_reply",
@@ -221,7 +221,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
                 "required": ["thread_id", "body"]
               },
               "requirements": [],
-              "permission_policy": "auto"
+              "permission_policy": "ask"
             },
             {
               "id": "resend_list_threads",
@@ -251,7 +251,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
                 "required": ["thread_id"]
               },
               "requirements": [],
-              "permission_policy": "auto"
+              "permission_policy": "ask"
             },
             {
               "id": "resend_label_thread",
@@ -274,7 +274,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
                 "required": ["thread_id"]
               },
               "requirements": [],
-              "permission_policy": "auto"
+              "permission_policy": "ask"
             }
           ],
           "artifact_handler": true,
