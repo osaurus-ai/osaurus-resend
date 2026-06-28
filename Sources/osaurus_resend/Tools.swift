@@ -16,14 +16,25 @@ struct ResendSendTool {
   func run(args: String, ctx: PluginContext) -> String {
     logDebug("resend_send: args=\(String(args.prefix(200)))")
     guard let input = parseJSON(args, as: Args.self) else {
-      return "{\"error\":\"Invalid arguments\"}"
+      return Envelope.failure(
+        .invalidArgs, "Invalid arguments: expected 'to', 'subject', and 'body'.")
+    }
+    if input.to.isEmpty || input.subject.isEmpty || input.body.isEmpty {
+      return Envelope.failure(
+        .invalidArgs, "Missing required argument: 'to', 'subject', and 'body' must be non-empty.")
     }
 
     guard let apiKey = configGet("api_key"), !apiKey.isEmpty else {
-      return "{\"error\":\"API key not configured\"}"
+      return Envelope.failure(
+        .unavailable,
+        "Resend API key is not configured. Set the 'api_key' secret in the plugin configuration.",
+        retryable: false)
     }
     guard let fromEmail = configGet("from_email"), !fromEmail.isEmpty else {
-      return "{\"error\":\"from_email not configured\"}"
+      return Envelope.failure(
+        .unavailable,
+        "from_email is not configured. Set 'from_email' in the plugin configuration.",
+        retryable: false)
     }
 
     if let blocked = checkSuppressed([input.to, input.cc, input.bcc].compactMap { $0 }) {
@@ -44,7 +55,7 @@ struct ResendSendTool {
 
     let (emailId, error) = resendSendEmail(apiKey: apiKey, params: params)
     guard let emailId else {
-      return "{\"error\":\"\(escapeJSON(error ?? "Send failed"))\"}"
+      return Envelope.failure(.executionError, error ?? "Send failed")
     }
 
     let threadId = UUID().uuidString
@@ -84,25 +95,39 @@ struct ResendReplyTool {
   func run(args: String, ctx: PluginContext) -> String {
     logDebug("resend_reply: args=\(String(args.prefix(200)))")
     guard let input = parseJSON(args, as: Args.self) else {
-      return "{\"error\":\"Invalid arguments\"}"
+      return Envelope.failure(
+        .invalidArgs, "Invalid arguments: expected 'thread_id' and 'body'.")
+    }
+    if input.thread_id.isEmpty || input.body.isEmpty {
+      return Envelope.failure(
+        .invalidArgs, "Missing required argument: 'thread_id' and 'body' must be non-empty.")
     }
 
     guard let apiKey = configGet("api_key"), !apiKey.isEmpty else {
-      return "{\"error\":\"API key not configured\"}"
+      return Envelope.failure(
+        .unavailable,
+        "Resend API key is not configured. Set the 'api_key' secret in the plugin configuration.",
+        retryable: false)
     }
     guard let fromEmail = configGet("from_email"), !fromEmail.isEmpty else {
-      return "{\"error\":\"from_email not configured\"}"
+      return Envelope.failure(
+        .unavailable,
+        "from_email is not configured. Set 'from_email' in the plugin configuration.",
+        retryable: false)
     }
 
     guard let thread = DatabaseManager.getThread(threadId: input.thread_id) else {
-      return "{\"error\":\"Thread not found\"}"
+      return Envelope.failure(.notFound, "Thread not found: \(input.thread_id)")
     }
 
     guard
       let recipients = computeReplyRecipients(
         thread: thread, fromEmail: fromEmail, explicitTo: input.to)
     else {
-      return "{\"error\":\"No recipients found in thread\"}"
+      return Envelope.failure(
+        .executionError,
+        "No recipients found in thread. Provide an explicit 'to' address.",
+        retryable: false)
     }
 
     if let blocked = checkSuppressed(recipients.to + recipients.cc) {
@@ -128,7 +153,7 @@ struct ResendReplyTool {
 
     let (emailId, error) = resendSendEmail(apiKey: apiKey, params: params)
     guard let emailId else {
-      return "{\"error\":\"\(escapeJSON(error ?? "Reply failed"))\"}"
+      return Envelope.failure(.executionError, error ?? "Reply failed")
     }
 
     DatabaseManager.insertMessage(
@@ -187,7 +212,7 @@ struct ResendListThreadsTool {
 
     guard let data = try? JSONSerialization.data(withJSONObject: ["threads": results]),
       let json = String(data: data, encoding: .utf8)
-    else { return "{\"threads\":[]}" }
+    else { return Envelope.failure(.executionError, "Failed to serialize thread list") }
     return json
   }
 }
@@ -205,11 +230,14 @@ struct ResendGetThreadTool {
   func run(args: String) -> String {
     logDebug("resend_get_thread: args=\(String(args.prefix(200)))")
     guard let input = parseJSON(args, as: Args.self) else {
-      return "{\"error\":\"Invalid arguments\"}"
+      return Envelope.failure(.invalidArgs, "Invalid arguments: expected 'thread_id'.")
+    }
+    if input.thread_id.isEmpty {
+      return Envelope.failure(.invalidArgs, "Missing required argument: 'thread_id'.")
     }
 
     guard let thread = DatabaseManager.getThread(threadId: input.thread_id) else {
-      return "{\"error\":\"Thread not found\"}"
+      return Envelope.failure(.notFound, "Thread not found: \(input.thread_id)")
     }
 
     let messages = DatabaseManager.getMessages(
@@ -244,7 +272,7 @@ struct ResendGetThreadTool {
 
     guard let data = try? JSONSerialization.data(withJSONObject: result),
       let json = String(data: data, encoding: .utf8)
-    else { return "{\"error\":\"Serialization failed\"}" }
+    else { return Envelope.failure(.executionError, "Failed to serialize thread response") }
     return json
   }
 }
@@ -263,11 +291,14 @@ struct ResendLabelThreadTool {
   func run(args: String) -> String {
     logDebug("resend_label_thread: args=\(String(args.prefix(200)))")
     guard let input = parseJSON(args, as: Args.self) else {
-      return "{\"error\":\"Invalid arguments\"}"
+      return Envelope.failure(.invalidArgs, "Invalid arguments: expected 'thread_id'.")
+    }
+    if input.thread_id.isEmpty {
+      return Envelope.failure(.invalidArgs, "Missing required argument: 'thread_id'.")
     }
 
     guard let thread = DatabaseManager.getThread(threadId: input.thread_id) else {
-      return "{\"error\":\"Thread not found\"}"
+      return Envelope.failure(.notFound, "Thread not found: \(input.thread_id)")
     }
 
     var labels = Set(thread.labels)
@@ -283,7 +314,7 @@ struct ResendLabelThreadTool {
         "labels": updatedLabels,
       ]),
       let json = String(data: data, encoding: .utf8)
-    else { return "{\"error\":\"Serialization failed\"}" }
+    else { return Envelope.failure(.executionError, "Failed to serialize label response") }
     return json
   }
 }
