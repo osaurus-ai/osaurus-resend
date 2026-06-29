@@ -35,7 +35,9 @@ struct ToolTests {
     let ctx = PluginContext()
     let args = "{\"to\":\"bob@x.com\",\"subject\":\"Hi\",\"body\":\"test\"}"
     let result = ctx.sendTool.run(args: args, ctx: ctx)
-    #expect(result.contains("error"))
+    #expect(result.contains("\"ok\":false"))
+    #expect(result.contains("\"kind\":\"unavailable\""))
+    #expect(result.contains("\"retryable\":false"))
     #expect(result.contains("API key"))
   }
 
@@ -46,7 +48,8 @@ struct ToolTests {
     let ctx = PluginContext()
     let args = "{\"to\":\"bob@x.com\",\"subject\":\"Hi\",\"body\":\"test\"}"
     let result = ctx.sendTool.run(args: args, ctx: ctx)
-    #expect(result.contains("error"))
+    #expect(result.contains("\"ok\":false"))
+    #expect(result.contains("\"kind\":\"unavailable\""))
     #expect(result.contains("from_email"))
   }
 
@@ -127,7 +130,9 @@ struct ToolTests {
     let ctx = PluginContext()
     let args = "{\"thread_id\":\"nonexistent\",\"body\":\"test\"}"
     let result = ctx.replyTool.run(args: args, ctx: ctx)
-    #expect(result.contains("error"))
+    #expect(result.contains("\"ok\":false"))
+    #expect(result.contains("\"kind\":\"not_found\""))
+    #expect(result.contains("\"retryable\":false"))
     #expect(result.contains("Thread not found"))
   }
 
@@ -245,7 +250,8 @@ struct ToolTests {
     DatabaseManager.initSchema()
     let tool = ResendGetThreadTool()
     let result = tool.run(args: "{\"thread_id\":\"nope\"}")
-    #expect(result.contains("error"))
+    #expect(result.contains("\"ok\":false"))
+    #expect(result.contains("\"kind\":\"not_found\""))
     #expect(result.contains("Thread not found"))
   }
 
