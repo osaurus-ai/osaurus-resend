@@ -58,21 +58,28 @@ private func currentMonotonicMillis() -> UInt64 {
 
 func resendRequest(
   apiKey: String, method: String, path: String,
-  body: [String: Any]? = nil
+  body: [String: Any]? = nil,
+  idempotencyKey: String? = nil
 ) -> (ok: Bool, data: [String: Any]?) {
   guard let httpRequest = hostAPI?.pointee.http_request else {
     logError("http_request not available")
     return (false, nil)
   }
 
+  var headers: [String: Any] = [
+    "Authorization": "Bearer \(apiKey)",
+    "Content-Type": "application/json",
+    "User-Agent": "osaurus-resend/\(resendPluginVersion)",
+  ]
+  // One key per logical operation: the request JSON (including this header)
+  // is built once and reused for every retry attempt, so Resend deduplicates
+  // a POST that we retried after a 429/5xx whose original actually landed.
+  if let idempotencyKey { headers["Idempotency-Key"] = idempotencyKey }
+
   var request: [String: Any] = [
     "method": method,
     "url": "https://api.resend.com\(path)",
-    "headers": [
-      "Authorization": "Bearer \(apiKey)",
-      "Content-Type": "application/json",
-      "User-Agent": "osaurus-resend/0.2.0",
-    ],
+    "headers": headers,
     "timeout_ms": 15000,
   ]
 
@@ -236,7 +243,9 @@ func resendSendEmail(apiKey: String, params: SendEmailParams) -> (emailId: Strin
     body["attachments"] = atts
   }
 
-  let (ok, data) = resendRequest(apiKey: apiKey, method: "POST", path: "/emails", body: body)
+  let (ok, data) = resendRequest(
+    apiKey: apiKey, method: "POST", path: "/emails", body: body,
+    idempotencyKey: UUID().uuidString)
   if ok, let id = data?["id"] as? String {
     logDebug("resendSendEmail: sent \(id)")
     return (id, nil)

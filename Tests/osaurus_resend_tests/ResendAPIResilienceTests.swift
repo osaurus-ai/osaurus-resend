@@ -102,6 +102,53 @@ struct ResendAPIResilienceTests {
     #expect(parsedRequests().count == 1)
   }
 
+  @Test("Retried POST /emails reuses one Idempotency-Key across all attempts")
+  func idempotencyKeyStableAcrossRetries() {
+    MockHost.setUp()
+    MockHost.pushHTTPResponse(status: 429, body: ["message": "rate limited"])
+    MockHost.pushHTTPResponse(status: 502, body: ["message": "bad gateway"])
+    MockHost.pushHTTPResponse(status: 200, body: ["id": "sent-1"])
+
+    let params = SendEmailParams(
+      from: "agent@d.com", to: ["bob@b.com"], subject: "Hi", html: "<p>x</p>",
+      text: nil, cc: nil, bcc: nil, replyTo: nil, headers: nil, attachments: nil)
+    let (emailId, error) = resendSendEmail(apiKey: "re_test", params: params)
+    #expect(emailId == "sent-1")
+    #expect(error == nil)
+
+    let keys = idempotencyKeys()
+    #expect(keys.count == 3, "every attempt must carry an Idempotency-Key")
+    #expect(Set(keys).count == 1, "all attempts must reuse the same key")
+    #expect(!(keys.first ?? "").isEmpty)
+  }
+
+  @Test("Separate logical sends use distinct Idempotency-Keys")
+  func distinctSendsUseDistinctKeys() {
+    MockHost.setUp()
+    MockHost.pushHTTPResponse(status: 200, body: ["id": "s1"])
+    MockHost.pushHTTPResponse(status: 200, body: ["id": "s2"])
+
+    let params = SendEmailParams(
+      from: "agent@d.com", to: ["bob@b.com"], subject: "Hi", html: "<p>x</p>",
+      text: nil, cc: nil, bcc: nil, replyTo: nil, headers: nil, attachments: nil)
+    _ = resendSendEmail(apiKey: "re_test", params: params)
+    _ = resendSendEmail(apiKey: "re_test", params: params)
+
+    let keys = idempotencyKeys()
+    #expect(keys.count == 2)
+    #expect(Set(keys).count == 2, "each logical send gets its own key")
+  }
+
+  private func idempotencyKeys() -> [String] {
+    mockHTTPRequests.compactMap { raw in
+      guard let data = raw.data(using: .utf8),
+        let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let headers = dict["headers"] as? [String: Any]
+      else { return nil }
+      return headers["Idempotency-Key"] as? String
+    }
+  }
+
   @Test("Client-side throttle spaces consecutive requests so we don't burst past 5/s")
   func throttleSpacesRequests() {
     MockHost.setUp()
