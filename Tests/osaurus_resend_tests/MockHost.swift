@@ -1,4 +1,5 @@
 import Foundation
+import OsaurusPluginABI
 
 @testable import osaurus_resend
 
@@ -26,7 +27,7 @@ nonisolated(unsafe) var mockDispatchCalls: [String] = []
 nonisolated(unsafe) var mockDispatchResult: String = "{\"id\":\"task-001\",\"status\":\"running\"}"
 nonisolated(unsafe) var mockFileContents: [String: String] = [:]
 nonisolated(unsafe) var mockLogMessages: [(Int32, String)] = []
-nonisolated(unsafe) var mockHostAPIStorage = osr_host_api()
+nonisolated(unsafe) var mockHostAPIStorage = OsrHostAPI()
 
 // MARK: - MockHost Setup
 
@@ -62,7 +63,12 @@ enum MockHost {
       // they're explicitly verifying rate-limit behavior.
       resendThrottleIntervalOverrideMs = 0
 
-      mockHostAPIStorage = osr_host_api()
+      // SDK `OsrHostAPI` struct, populated exactly like the real host's
+      // exec contract. Version stays 2 (what these tests always mocked);
+      // trailing v3+ slots stay nil, which is precisely how an older host
+      // presents to a newer plugin — HostBridge then falls back to libc
+      // free() for host strings, pairing with `mockStr`'s strdup.
+      mockHostAPIStorage = OsrHostAPI()
       mockHostAPIStorage.version = 2
       mockHostAPIStorage.config_get = mockConfigGet
       mockHostAPIStorage.config_set = mockConfigSet
@@ -77,7 +83,11 @@ enum MockHost {
       mockHostAPIStorage.dispatch_interrupt = mockDispatchInterrupt
 
       withUnsafePointer(to: &mockHostAPIStorage) { ptr in
+        // Same injection path as production: raw pointer for the slots the
+        // bridge doesn't cover (db/http/dispatch/file_read), plus
+        // HostBridge for config/log/free.
         hostAPI = ptr
+        HostBridge.shared.install(ptr)
       }
     }
   }
@@ -136,7 +146,7 @@ enum MockHost {
 
 // MARK: - C Callbacks
 
-private let mockConfigGet: osr_config_get_fn = { keyPtr in
+private let mockConfigGet: OsrConfigGetFn = { keyPtr in
   guard let keyPtr else { return nil }
   let key = String(cString: keyPtr)
   return withMockLock {
@@ -145,7 +155,7 @@ private let mockConfigGet: osr_config_get_fn = { keyPtr in
   }
 }
 
-private let mockConfigSet: osr_config_set_fn = { keyPtr, valuePtr in
+private let mockConfigSet: OsrConfigSetFn = { keyPtr, valuePtr in
   guard let keyPtr else { return }
   let key = String(cString: keyPtr)
   if let valuePtr {
@@ -154,19 +164,19 @@ private let mockConfigSet: osr_config_set_fn = { keyPtr, valuePtr in
   }
 }
 
-private let mockConfigDelete: osr_config_delete_fn = { keyPtr in
+private let mockConfigDelete: OsrConfigDeleteFn = { keyPtr in
   guard let keyPtr else { return }
   let key = String(cString: keyPtr)
   withMockLock { _ = mockConfig.removeValue(forKey: key) }
 }
 
-private let mockLog: osr_log_fn = { level, msgPtr in
+private let mockLog: OsrLogFn = { level, msgPtr in
   guard let msgPtr else { return }
   let msg = String(cString: msgPtr)
   withMockLock { mockLogMessages.append((level, msg)) }
 }
 
-private let mockHttpRequest: osr_http_request_fn = { requestPtr in
+private let mockHttpRequest: OsrHttpRequestFn = { requestPtr in
   let request = requestPtr.map { String(cString: $0) }
   return withMockLock {
     if let request { mockHTTPRequests.append(request) }
@@ -178,7 +188,7 @@ private let mockHttpRequest: osr_http_request_fn = { requestPtr in
   }
 }
 
-private let mockDispatch: osr_dispatch_fn = { requestPtr in
+private let mockDispatch: OsrDispatchFn = { requestPtr in
   if let requestPtr {
     let req = String(cString: requestPtr)
     withMockLock { mockDispatchCalls.append(req) }
@@ -187,7 +197,7 @@ private let mockDispatch: osr_dispatch_fn = { requestPtr in
   return mockStr(result)
 }
 
-private let mockFileRead: osr_file_read_fn = { pathPtr in
+private let mockFileRead: OsrFileReadFn = { pathPtr in
   guard let pathPtr else { return nil }
   let path = String(cString: pathPtr)
   let content = withMockLock { mockFileContents[path] }
@@ -198,7 +208,7 @@ private let mockFileRead: osr_file_read_fn = { pathPtr in
   return mockStr(content)
 }
 
-private let mockDispatchAddIssue: osr_dispatch_add_issue_fn = { taskPtr, payloadPtr in
+private let mockDispatchAddIssue: OsrDispatchAddIssueFn = { taskPtr, payloadPtr in
   guard let taskPtr, let payloadPtr else { return nil }
   let taskId = String(cString: taskPtr)
   let payload = String(cString: payloadPtr)
@@ -206,7 +216,7 @@ private let mockDispatchAddIssue: osr_dispatch_add_issue_fn = { taskPtr, payload
   return mockStr("{\"ok\":true}")
 }
 
-private let mockDispatchInterrupt: osr_dispatch_interrupt_fn = { taskPtr, msgPtr in
+private let mockDispatchInterrupt: OsrDispatchInterruptFn = { taskPtr, msgPtr in
   guard let taskPtr else { return }
   let taskId = String(cString: taskPtr)
   let message = msgPtr.map { String(cString: $0) } ?? ""
@@ -215,7 +225,7 @@ private let mockDispatchInterrupt: osr_dispatch_interrupt_fn = { taskPtr, msgPtr
 
 // MARK: - Mock DB
 
-private let mockDbExec: osr_db_exec_fn = { sqlPtr, paramsPtr in
+private let mockDbExec: OsrDbExecFn = { sqlPtr, paramsPtr in
   guard let sqlPtr else { return nil }
   let sql = String(cString: sqlPtr).trimmingCharacters(in: .whitespacesAndNewlines)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"
@@ -371,7 +381,7 @@ private func mockDbExecLocked(sql: String, paramValues: [Any]) -> UnsafePointer<
   return mockStr("{\"ok\":true}")
 }
 
-private let mockDbQuery: osr_db_query_fn = { sqlPtr, paramsPtr in
+private let mockDbQuery: OsrDbQueryFn = { sqlPtr, paramsPtr in
   guard let sqlPtr else { return nil }
   let sql = String(cString: sqlPtr).trimmingCharacters(in: .whitespacesAndNewlines)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"

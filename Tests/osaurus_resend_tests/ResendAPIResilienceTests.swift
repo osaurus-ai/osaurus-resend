@@ -1,4 +1,5 @@
 import Foundation
+import OsaurusPluginABI
 import Testing
 
 @testable import osaurus_resend
@@ -83,7 +84,7 @@ struct ResendAPIResilienceTests {
 
     // Find the warning log for the failed request.
     let warning = mockLogMessages.first { entry in
-      entry.0 == 2 && entry.1.contains("HTTP 500")
+      entry.0 == OsrLogLevel.warn && entry.1.contains("HTTP 500")
     }
     #expect(warning != nil)
     if let w = warning {
