@@ -2,6 +2,10 @@ import Foundation
 
 // MARK: - Route Handler
 
+/// Upper bound on accepted request bodies. Resend webhook payloads are a few
+/// KB; anything near this size is hostile or corrupt.
+let maxRouteBodyBytes = 1_048_576
+
 func handleRoute(ctx: PluginContext, requestJSON: String) -> String {
   guard let req = parseJSON(requestJSON, as: RouteRequest.self) else {
     logWarn("handleRoute: failed to parse request")
@@ -9,11 +13,47 @@ func handleRoute(ctx: PluginContext, requestJSON: String) -> String {
   }
 
   switch req.route_id {
-  case "webhook": return handleWebhook(ctx: ctx, req: req)
-  case "health": return handleHealth(ctx: ctx)
-  case "reset_webhook": return handleResetWebhook(ctx: ctx)
+  case "webhook":
+    if let rejection = validateRequest(req, method: "POST", requireJSONBody: true) {
+      return rejection
+    }
+    return handleWebhook(ctx: ctx, req: req)
+  case "health":
+    if let rejection = validateRequest(req, method: "GET", requireJSONBody: false) {
+      return rejection
+    }
+    return handleHealth(ctx: ctx)
+  case "reset_webhook":
+    if let rejection = validateRequest(req, method: "POST", requireJSONBody: false) {
+      return rejection
+    }
+    return handleResetWebhook(ctx: ctx)
   default: return makeRouteResponse(status: 404, body: "{\"error\":\"Not found\"}")
   }
+}
+
+/// Method / content-type / body-size gate applied before any route handler
+/// runs. Returns a ready-made rejection response, or `nil` when the request
+/// is acceptable.
+private func validateRequest(
+  _ req: RouteRequest, method expectedMethod: String, requireJSONBody: Bool
+) -> String? {
+  if req.method.uppercased() != expectedMethod {
+    logWarn("handleRoute: method \(req.method) not allowed for \(req.route_id)")
+    return makeRouteResponse(status: 405, body: "{\"error\":\"Method not allowed\"}")
+  }
+  if let body = req.body, body.utf8.count > maxRouteBodyBytes {
+    logWarn("handleRoute: body too large (\(body.utf8.count) bytes) for \(req.route_id)")
+    return makeRouteResponse(status: 413, body: "{\"error\":\"Payload too large\"}")
+  }
+  if requireJSONBody, let body = req.body, !body.isEmpty {
+    let contentType = findHeader(req.headers, name: "content-type") ?? ""
+    if !contentType.lowercased().contains("application/json") {
+      logWarn("handleRoute: unsupported content type '\(contentType)' for \(req.route_id)")
+      return makeRouteResponse(status: 415, body: "{\"error\":\"Unsupported media type\"}")
+    }
+  }
+  return nil
 }
 
 // MARK: - Webhook Endpoint
@@ -24,24 +64,19 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
     return makeRouteResponse(status: 200, body: "ok")
   }
 
-  // 1. Verify Svix signature when configured. We deliberately return 401 (not
-  //    200) on bad signatures so Svix retries and the failure shows up in
-  //    Resend's webhook events list.
+  // 1. Verify Svix signature, failing closed. 503 while no secret is
+  //    persisted yet (bootstrap window: Svix retries and the delivery is
+  //    processed once registration completes); 401 for bad signatures so the
+  //    failure shows up in Resend's webhook events list.
   let svixId = findHeader(req.headers, name: "svix-id")
   switch verifyIncomingWebhook(req: req, body: body) {
   case .ok: break
   case .reject(let reason):
     logWarn("handleWebhook: signature verification failed: \(reason)")
     return makeRouteResponse(status: 401, body: "{\"error\":\"Invalid signature\"}")
-  case .acceptUnverified(let reason):
-    logWarn("handleWebhook: \(reason); accepting unverified")
-  }
-
-  // 2. Dedupe by svix-id across all event types. Same delivery reaching us
-  //    twice (e.g. our 200 ack was lost) must process exactly once.
-  if let svixId, !svixId.isEmpty, !DatabaseManager.recordSvixId(svixId) {
-    logDebug("handleWebhook: skipping duplicate svix-id=\(svixId)")
-    return makeRouteResponse(status: 200, body: "ok")
+  case .notReady(let reason):
+    logWarn("handleWebhook: \(reason); rejecting until webhook registration persists a secret")
+    return makeRouteResponse(status: 503, body: "{\"error\":\"Webhook not configured yet\"}")
   }
 
   guard let event = parseJSON(body, as: ResendWebhookEvent.self) else {
@@ -49,22 +84,54 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
     return makeRouteResponse(status: 200, body: "ok")
   }
 
+  // 2. Claim the delivery id (atomic). Completed ids are duplicates and get
+  //    200; an in-flight claim means a parallel delivery is still processing,
+  //    so ask Svix to retry later rather than double-process.
+  if let svixId, !svixId.isEmpty {
+    switch DatabaseManager.claimSvixId(svixId) {
+    case .claimed: break
+    case .alreadyCompleted:
+      logDebug("handleWebhook: skipping duplicate svix-id=\(svixId)")
+      return makeRouteResponse(status: 200, body: "ok")
+    case .inFlight:
+      logDebug("handleWebhook: svix-id=\(svixId) still in flight, asking for retry")
+      return makeRouteResponse(status: 503, body: "{\"error\":\"Delivery is being processed\"}")
+    }
+  }
+
   logDebug("handleWebhook: type=\(event.type) email_id=\(event.data.email_id)")
-  dispatchEvent(event: event, body: body, req: req, ctx: ctx)
-  return makeRouteResponse(status: 200, body: "ok")
+  // 3. Only mark completed after successful processing. Transient failures
+  //    release the claim and return a retryable 5xx so Svix redelivers.
+  switch dispatchEvent(event: event, body: body, req: req, ctx: ctx) {
+  case .success:
+    if let svixId, !svixId.isEmpty { DatabaseManager.completeSvixId(svixId) }
+    return makeRouteResponse(status: 200, body: "ok")
+  case .transientFailure(let reason):
+    logWarn("handleWebhook: transient failure (\(reason)), requesting redelivery")
+    if let svixId, !svixId.isEmpty { DatabaseManager.releaseSvixId(svixId) }
+    return makeRouteResponse(status: 503, body: "{\"error\":\"Processing failed, retry\"}")
+  }
+}
+
+/// Outcome of processing one webhook event. Permanent conditions (unauthorized
+/// sender, unknown event type, duplicates) count as `success` so the provider
+/// stops redelivering; `transientFailure` means a retry may succeed.
+private enum ProcessingOutcome {
+  case success
+  case transientFailure(String)
 }
 
 private func dispatchEvent(
   event: ResendWebhookEvent, body: String, req: RouteRequest, ctx: PluginContext
-) {
+) -> ProcessingOutcome {
   switch event.type {
   case "email.received":
     let emailId = event.data.email_id
     if DatabaseManager.hasEmailId(emailId) {
       logDebug("handleWebhook: skipping already-processed email_id=\(emailId)")
-      return
+      return .success
     }
-    processInboundEmail(
+    return processInboundEmail(
       ctx: ctx, eventData: event.data, agentAddress: req.osaurus?.agent_address)
   case "email.bounced":
     let reason = event.data.bounce_message ?? "bounced"
@@ -72,18 +139,23 @@ private func dispatchEvent(
       ctx: ctx, eventData: event.data, suppressReason: "bounce: \(reason)",
       eventType: "bounced", detail: reason,
       summary: "Email to {recipients} bounced: \(reason)")
+    return .success
   case "email.complained":
     handleSuppressionEvent(
       ctx: ctx, eventData: event.data, suppressReason: "complaint",
       eventType: "complained", detail: nil,
       summary: "Recipient {recipients} marked your email as spam.")
+    return .success
   case "email.failed":
     handleSendFailure(ctx: ctx, eventData: event.data, body: body)
+    return .success
   case "email.delivered":
     DatabaseManager.recordEmailEvent(
       emailId: event.data.email_id, type: "delivered", detail: nil)
+    return .success
   default:
     logDebug("handleWebhook: ignoring event type \(event.type)")
+    return .success
   }
 }
 
@@ -92,15 +164,16 @@ private func dispatchEvent(
 private enum SignatureCheck {
   case ok
   case reject(String)
-  case acceptUnverified(String)
+  case notReady(String)
 }
 
 private func verifyIncomingWebhook(req: RouteRequest, body: String) -> SignatureCheck {
-  // No secret configured yet (fresh install pre-registration, or upgrade from
-  // an older plugin that didn't persist the secret). Accept with a loud warning
-  // rather than silently 200ing or hard-failing the webhook.
+  // No secret persisted yet (fresh install pre-registration, or upgrade from
+  // an older plugin that didn't persist the secret). Fail closed: 503 tells
+  // Svix to redeliver once registration completes, instead of processing
+  // unauthenticated payloads.
   guard let signingSecret = configGet("signing_secret"), !signingSecret.isEmpty else {
-    return .acceptUnverified("signing_secret not configured")
+    return .notReady("signing_secret not configured")
   }
 
   guard let svixId = findHeader(req.headers, name: "svix-id"),
@@ -203,20 +276,20 @@ private func dispatchInterrupt(taskId: String, message: String) -> Bool {
 
 private func processInboundEmail(
   ctx: PluginContext, eventData: ResendEmailEventData, agentAddress: String?
-) {
+) -> ProcessingOutcome {
   let senderEmail = extractEmailAddress(eventData.from ?? "")
   if !isAuthorized(sender: senderEmail) {
     logInfo("Unauthorized sender \(senderEmail), ignoring")
-    return
+    return .success
   }
 
   guard let apiKey = configGet("api_key"), !apiKey.isEmpty else {
     logError("processInboundEmail: no API key configured")
-    return
+    return .transientFailure("no API key configured")
   }
   guard let received = resendGetReceivedEmail(apiKey: apiKey, emailId: eventData.email_id) else {
     logError("processInboundEmail: failed to fetch email body for \(eventData.email_id)")
-    return
+    return .transientFailure("failed to fetch email body")
   }
 
   let parsed = ParsedInboundEmail(received: received, eventData: eventData)
@@ -231,8 +304,14 @@ private func processInboundEmail(
     hasAttachments: parsed.hasAttachments
   )
 
-  dispatchInboundTask(
+  let outcome = dispatchInboundTask(
     ctx: ctx, parsed: parsed, threadId: threadId, agentAddress: agentAddress)
+  if case .transientFailure = outcome {
+    // Roll back the inbound row so the provider's redelivery isn't skipped by
+    // the hasEmailId dedupe and gets a full re-process.
+    DatabaseManager.deleteMessagesByEmailId(eventData.email_id, direction: "in")
+  }
+  return outcome
 }
 
 /// View into the parsed shape of an inbound email used by the inbound pipeline,
@@ -321,10 +400,10 @@ private let pinnedReplyTools = [
 
 private func dispatchInboundTask(
   ctx: PluginContext, parsed: ParsedInboundEmail, threadId: String, agentAddress: String?
-) {
+) -> ProcessingOutcome {
   guard let dispatch = hostAPI?.pointee.dispatch else {
     logError("processInboundEmail: dispatch not available")
-    return
+    return .transientFailure("dispatch not available")
   }
 
   // Follow-up email on a thread with an in-flight task: inject the new body
@@ -363,7 +442,7 @@ private func dispatchInboundTask(
 
   guard let payloadJSON = makeJSONString(payload) else {
     logError("processInboundEmail: failed to serialize dispatch payload")
-    return
+    return .transientFailure("failed to serialize dispatch payload")
   }
 
   guard let resultStr = callHostString(payloadJSON, via: dispatch),
@@ -371,12 +450,13 @@ private func dispatchInboundTask(
     let taskId = result.id
   else {
     logError("processInboundEmail: dispatch failed")
-    return
+    return .transientFailure("dispatch failed")
   }
 
   DatabaseManager.updateThread(threadId: threadId, taskId: taskId)
   ctx.taskDispatchTimestamps[taskId] = Int(Date().timeIntervalSince1970)
   logInfo("Dispatched task \(taskId) for email from \(parsed.fromEmail) in thread \(threadId)")
+  return .success
 }
 
 // MARK: - Authorization

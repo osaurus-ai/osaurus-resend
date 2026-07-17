@@ -77,6 +77,7 @@ enum DatabaseManager {
       """
       CREATE TABLE IF NOT EXISTS processed_svix_ids (
         svix_id    TEXT PRIMARY KEY,
+        status     TEXT NOT NULL DEFAULT 'completed',
         created_at INTEGER DEFAULT (unixepoch())
       )
       """,
@@ -92,6 +93,19 @@ enum DatabaseManager {
     ]
     for sql in statements {
       dbExec(sql, params: "[]")
+    }
+
+    // Migration: pre-1.3.1 databases created processed_svix_ids without the
+    // status column. Existing rows were fully processed, so 'completed' is
+    // the correct backfill (it is also the column default).
+    let hasStatusColumn =
+      queryScalarInt(
+        "SELECT COUNT(*) FROM pragma_table_info('processed_svix_ids') WHERE name = 'status'",
+        values: []) > 0
+    if !hasStatusColumn {
+      dbExec(
+        "ALTER TABLE processed_svix_ids ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'",
+        params: "[]")
     }
 
     // Best-effort GC of replay-protection rows older than 30 days.
@@ -275,6 +289,15 @@ enum DatabaseManager {
     return queryScalarInt(sql, values: [threadId, sinceTimestamp]) > 0
   }
 
+  /// Removes messages recorded for a given provider email id. Used to roll
+  /// back a partially processed inbound email so a webhook redelivery gets a
+  /// clean re-process instead of being skipped by the email-id dedupe.
+  static func deleteMessagesByEmailId(_ emailId: String, direction: String) {
+    dbExec(
+      "DELETE FROM messages WHERE email_id = ?1 AND direction = ?2",
+      params: serializeParams([emailId, direction]))
+  }
+
   static func getLastMessagePreview(threadId: String) -> String? {
     let sql = "SELECT body_text FROM messages WHERE thread_id = ?1 ORDER BY created_at DESC LIMIT 1"
     guard let row = queryFirstRow(sql, values: [threadId]),
@@ -362,17 +385,55 @@ enum DatabaseManager {
 
   // MARK: - Svix Replay Protection
 
-  /// Records a Svix delivery id; returns `false` if the id has already been seen.
-  /// Backed by `INSERT OR IGNORE` against a PRIMARY KEY.
-  static func recordSvixId(_ svixId: String) -> Bool {
-    let alreadySeen = queryScalarInt(
-      "SELECT COUNT(*) FROM processed_svix_ids WHERE svix_id = ?1",
-      values: [svixId]) > 0
-    if alreadySeen { return false }
+  enum SvixClaim {
+    /// This delivery is ours to process (fresh id, or takeover of a stale claim).
+    case claimed
+    /// A previous delivery of this id was fully processed; skip with 200.
+    case alreadyCompleted
+    /// Another in-flight claim holds the lease; retry later with 503.
+    case inFlight
+  }
+
+  /// A `processing` claim older than this is considered abandoned (crashed or
+  /// hung worker) and may be taken over by a redelivery.
+  static let svixClaimLeaseSeconds = 300
+
+  /// Atomically claims a Svix delivery id for processing. The claim is a
+  /// single INSERT with an affected-row check: fresh ids insert a `processing`
+  /// row, stale `processing` rows (lease expired) are re-claimed, and anything
+  /// else leaves the row untouched (0 rows affected).
+  static func claimSvixId(_ svixId: String) -> SvixClaim {
+    let sql = """
+      INSERT INTO processed_svix_ids (svix_id, status, created_at)
+      VALUES (?1, 'processing', unixepoch())
+      ON CONFLICT(svix_id) DO UPDATE SET created_at = unixepoch()
+        WHERE processed_svix_ids.status = 'processing'
+          AND processed_svix_ids.created_at < (unixepoch() - \(svixClaimLeaseSeconds))
+      """
+    if dbExec(sql, params: serializeParams([svixId])) > 0 {
+      return .claimed
+    }
+    let status =
+      queryFirstRow(
+        "SELECT status FROM processed_svix_ids WHERE svix_id = ?1",
+        values: [svixId])?.first as? String
+    return status == "completed" ? .alreadyCompleted : .inFlight
+  }
+
+  /// Marks a claimed delivery as fully processed. Only after this call do
+  /// duplicate deliveries get skipped.
+  static func completeSvixId(_ svixId: String) {
     dbExec(
-      "INSERT OR IGNORE INTO processed_svix_ids (svix_id, created_at) VALUES (?1, unixepoch())",
+      "UPDATE processed_svix_ids SET status = 'completed' WHERE svix_id = ?1",
       params: serializeParams([svixId]))
-    return true
+  }
+
+  /// Releases a claim after a transient processing failure so the provider's
+  /// retry can re-claim immediately instead of waiting out the lease.
+  static func releaseSvixId(_ svixId: String) {
+    dbExec(
+      "DELETE FROM processed_svix_ids WHERE svix_id = ?1 AND status = 'processing'",
+      params: serializeParams([svixId]))
   }
 
   // MARK: - Query Helpers
@@ -458,14 +519,23 @@ enum DatabaseManager {
 
   // MARK: - DB Execution
 
-  static func dbExec(_ sql: String, params: String) {
+  /// Executes a statement and returns the number of affected rows (the host
+  /// replies `{"changes":N,"last_insert_rowid":N}`). Returns 0 on any failure.
+  @discardableResult
+  static func dbExec(_ sql: String, params: String) -> Int {
     guard let exec = hostAPI?.pointee.db_exec else {
       logError("db_exec not available")
-      return
+      return 0
     }
-    if let result = callHostString(sql, params, via: exec), result.contains("\"error\"") {
+    guard let result = callHostString(sql, params, via: exec) else { return 0 }
+    if result.contains("\"error\"") {
       logWarn("DB exec error: \(result)")
+      return 0
     }
+    guard let data = result.data(using: .utf8),
+      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return 0 }
+    return dict["changes"] as? Int ?? 0
   }
 
   static func dbQuery(_ sql: String, params: String) -> String? {

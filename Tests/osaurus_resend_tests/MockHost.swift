@@ -32,7 +32,7 @@ nonisolated(unsafe) var mockHostAPIStorage = osr_host_api()
 
 nonisolated(unsafe) var mockSuppressedAddresses: [String: (reason: String, createdAt: Int)] = [:]
 nonisolated(unsafe) var mockEmailEvents: [(emailId: String, type: String, detail: String?)] = []
-nonisolated(unsafe) var mockSvixIds: Set<String> = []
+nonisolated(unsafe) var mockSvixIds: [String: (status: String, createdAt: Int)] = [:]
 nonisolated(unsafe) var mockAddIssueCalls: [(taskId: String, payload: String)] = []
 nonisolated(unsafe) var mockDispatchInterruptCalls: [(taskId: String, message: String)] = []
 
@@ -51,7 +51,7 @@ enum MockHost {
       mockLogMessages = []
       mockSuppressedAddresses = [:]
       mockEmailEvents = []
-      mockSvixIds = []
+      mockSvixIds = [:]
       mockAddIssueCalls = []
       mockDispatchInterruptCalls = []
 
@@ -266,15 +266,52 @@ private func mockDbExecLocked(sql: String, paramValues: [Any]) -> UnsafePointer<
     return mockStr("{\"ok\":true}")
   }
 
-  if sql.hasPrefix("INSERT OR IGNORE INTO processed_svix_ids") {
-    if let sid = paramValues.first as? String {
-      mockSvixIds.insert(sid)
+  if sql.hasPrefix("INSERT INTO processed_svix_ids") {
+    guard let sid = paramValues.first as? String else { return mockChanges(0) }
+    let now = Int(Date().timeIntervalSince1970)
+    if let existing = mockSvixIds[sid] {
+      // Mirrors the ON CONFLICT DO UPDATE ... WHERE clause: only stale
+      // 'processing' claims (lease expired) are re-claimed.
+      let lease = DatabaseManager.svixClaimLeaseSeconds
+      if existing.status == "processing", existing.createdAt < now - lease {
+        mockSvixIds[sid] = (status: "processing", createdAt: now)
+        return mockChanges(1)
+      }
+      return mockChanges(0)
     }
-    return mockStr("{\"ok\":true}")
+    mockSvixIds[sid] = (status: "processing", createdAt: now)
+    return mockChanges(1)
+  }
+
+  if sql.hasPrefix("UPDATE processed_svix_ids SET status = 'completed'") {
+    guard let sid = paramValues.first as? String, let existing = mockSvixIds[sid] else {
+      return mockChanges(0)
+    }
+    mockSvixIds[sid] = (status: "completed", createdAt: existing.createdAt)
+    return mockChanges(1)
+  }
+
+  if sql.hasPrefix("DELETE FROM processed_svix_ids WHERE svix_id = ?1") {
+    guard let sid = paramValues.first as? String,
+      mockSvixIds[sid]?.status == "processing"
+    else { return mockChanges(0) }
+    mockSvixIds.removeValue(forKey: sid)
+    return mockChanges(1)
   }
 
   if sql.hasPrefix("DELETE FROM processed_svix_ids") {
     return mockStr("{\"ok\":true}")
+  }
+
+  if sql.hasPrefix("DELETE FROM messages WHERE email_id = ?1") {
+    guard let eid = paramValues.first as? String,
+      let dir = paramValues[safe: 1] as? String
+    else { return mockChanges(0) }
+    let before = mockMessages.count
+    mockMessages.removeAll {
+      ($0["email_id"] as? String) == eid && ($0["direction"] as? String) == dir
+    }
+    return mockChanges(before - mockMessages.count)
   }
 
   if sql.hasPrefix("INSERT INTO messages") {
@@ -356,8 +393,15 @@ private func mockDbQueryLocked(sql: String, paramValues: [Any]) -> UnsafePointer
     && sql.contains("SELECT COUNT(*)")
   {
     guard let sid = paramValues.first as? String else { return returnRows([[0]]) }
-    let count = mockSvixIds.contains(sid) ? 1 : 0
+    let count = mockSvixIds[sid] != nil ? 1 : 0
     return returnRows([[count]])
+  }
+
+  if sql.contains("SELECT status FROM processed_svix_ids WHERE svix_id = ?1") {
+    guard let sid = paramValues.first as? String,
+      let entry = mockSvixIds[sid]
+    else { return returnRows([]) }
+    return returnRows([[entry.status]])
   }
 
   if sql.contains("JOIN messages m ON m.thread_id = t.thread_id")
@@ -567,4 +611,9 @@ extension Array {
 private func mockStr(_ s: String) -> UnsafePointer<CChar>? {
   guard let ptr = strdup(s) else { return nil }
   return UnsafePointer(ptr)
+}
+
+/// Mirrors the real host's `db_exec` result: `{"changes":N,"last_insert_rowid":N}`.
+private func mockChanges(_ n: Int) -> UnsafePointer<CChar>? {
+  mockStr("{\"changes\":\(n),\"last_insert_rowid\":0}")
 }

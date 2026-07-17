@@ -396,11 +396,8 @@ struct InboundFollowupTests {
     let body1 = """
       {"type":"email.received","data":{"email_id":"e-1","from":"alice@a.com","to":["agent@d.com"],"subject":"Hi","message_id":"<m1>"}}
       """
-    let req1: [String: Any] = [
-      "route_id": "webhook", "method": "POST", "path": "/webhook", "body": body1,
-      "headers": ["svix-id": "msg-1"],
-    ]
-    _ = handleRoute(ctx: PluginContext(), requestJSON: makeJSONString(req1) ?? "{}")
+    _ = handleRoute(
+      ctx: PluginContext(), requestJSON: SignedWebhook.requestJSON(body: body1, svixId: "msg-1"))
 
     #expect(mockDispatchCalls.count == 1)
     #expect(mockDispatchInterruptCalls.isEmpty)
@@ -419,11 +416,8 @@ struct InboundFollowupTests {
     let body2 = """
       {"type":"email.received","data":{"email_id":"e-2","from":"alice@a.com","to":["agent@d.com"],"subject":"Re: Hi","message_id":"<m2>"}}
       """
-    let req2: [String: Any] = [
-      "route_id": "webhook", "method": "POST", "path": "/webhook", "body": body2,
-      "headers": ["svix-id": "msg-2"],
-    ]
-    _ = handleRoute(ctx: PluginContext(), requestJSON: makeJSONString(req2) ?? "{}")
+    _ = handleRoute(
+      ctx: PluginContext(), requestJSON: SignedWebhook.requestJSON(body: body2, svixId: "msg-2"))
 
     #expect(mockDispatchInterruptCalls.count == 1)
     if let call = mockDispatchInterruptCalls.first {
@@ -450,11 +444,9 @@ struct InboundFollowupTests {
     let body = """
       {"type":"email.received","data":{"email_id":"e-shape","from":"x@x.com","to":["agent@d.com"],"subject":"Shape","message_id":"<m-shape>"}}
       """
-    let req: [String: Any] = [
-      "route_id": "webhook", "method": "POST", "path": "/webhook", "body": body,
-      "headers": ["svix-id": "msg-shape"],
-    ]
-    _ = handleRoute(ctx: PluginContext(), requestJSON: makeJSONString(req) ?? "{}")
+    _ = handleRoute(
+      ctx: PluginContext(),
+      requestJSON: SignedWebhook.requestJSON(body: body, svixId: "msg-shape"))
 
     #expect(mockDispatchCalls.count == 1)
     guard let dispatchJSON = mockDispatchCalls.first,
