@@ -33,7 +33,14 @@ nonisolated(unsafe) var mockHostAPIStorage = OsrHostAPI()
 
 nonisolated(unsafe) var mockSuppressedAddresses: [String: (reason: String, createdAt: Int)] = [:]
 nonisolated(unsafe) var mockEmailEvents: [(emailId: String, type: String, detail: String?)] = []
-nonisolated(unsafe) var mockSvixIds: [String: (status: String, createdAt: Int)] = [:]
+nonisolated(unsafe) var mockSvixIds:
+  [String: (status: String, createdAt: Int, payload: String?)] = [:]
+
+/// When true, INSERTs into processed_svix_ids affect 0 rows and the row is
+/// not recorded — simulating a host whose database layer is unavailable.
+/// Durable-first tests use this to verify the webhook refuses to ack
+/// un-persisted deliveries.
+nonisolated(unsafe) var mockFailSvixInserts = false
 nonisolated(unsafe) var mockAddIssueCalls: [(taskId: String, payload: String)] = []
 nonisolated(unsafe) var mockDispatchInterruptCalls: [(taskId: String, message: String)] = []
 
@@ -53,8 +60,15 @@ enum MockHost {
       mockSuppressedAddresses = [:]
       mockEmailEvents = []
       mockSvixIds = [:]
+      mockFailSvixInserts = false
       mockAddIssueCalls = []
       mockDispatchInterruptCalls = []
+
+      // Webhook worker runs inline by default so the existing synchronous
+      // suites can assert right after `handleRoute` returns. Async-drain
+      // regression tests flip this off and synchronize via
+      // `ctx.webhookWorker.waitUntilIdle()`.
+      WebhookWorkQueue.executeInlineForTesting = true
 
       // Make the resend retry/backoff loop instantaneous in tests so 429/5xx
       // exploration doesn't sleep for seconds.
@@ -277,19 +291,24 @@ private func mockDbExecLocked(sql: String, paramValues: [Any]) -> UnsafePointer<
   }
 
   if sql.hasPrefix("INSERT INTO processed_svix_ids") {
+    if mockFailSvixInserts { return mockChanges(0) }
     guard let sid = paramValues.first as? String else { return mockChanges(0) }
+    let payload = paramValues[safe: 1] as? String
     let now = Int(Date().timeIntervalSince1970)
     if let existing = mockSvixIds[sid] {
       // Mirrors the ON CONFLICT DO UPDATE ... WHERE clause: only stale
-      // 'processing' claims (lease expired) are re-claimed.
+      // 'processing' claims (lease expired) are re-claimed. COALESCE
+      // preserves the original delivery's payload on takeover with nil.
       let lease = DatabaseManager.svixClaimLeaseSeconds
       if existing.status == "processing", existing.createdAt < now - lease {
-        mockSvixIds[sid] = (status: "processing", createdAt: now)
+        mockSvixIds[sid] = (
+          status: "processing", createdAt: now, payload: payload ?? existing.payload
+        )
         return mockChanges(1)
       }
       return mockChanges(0)
     }
-    mockSvixIds[sid] = (status: "processing", createdAt: now)
+    mockSvixIds[sid] = (status: "processing", createdAt: now, payload: payload)
     return mockChanges(1)
   }
 
@@ -297,15 +316,8 @@ private func mockDbExecLocked(sql: String, paramValues: [Any]) -> UnsafePointer<
     guard let sid = paramValues.first as? String, let existing = mockSvixIds[sid] else {
       return mockChanges(0)
     }
-    mockSvixIds[sid] = (status: "completed", createdAt: existing.createdAt)
-    return mockChanges(1)
-  }
-
-  if sql.hasPrefix("DELETE FROM processed_svix_ids WHERE svix_id = ?1") {
-    guard let sid = paramValues.first as? String,
-      mockSvixIds[sid]?.status == "processing"
-    else { return mockChanges(0) }
-    mockSvixIds.removeValue(forKey: sid)
+    // Mirrors `payload = NULL` in the production statement.
+    mockSvixIds[sid] = (status: "completed", createdAt: existing.createdAt, payload: nil)
     return mockChanges(1)
   }
 
@@ -399,6 +411,12 @@ private func mockDbQueryLocked(sql: String, paramValues: [Any]) -> UnsafePointer
     return returnRows([])
   }
 
+  if sql.contains("FROM processed_svix_ids WHERE svix_id = ?1 AND payload IS NOT NULL") {
+    guard let sid = paramValues.first as? String else { return returnRows([[0]]) }
+    let count = mockSvixIds[sid]?.payload != nil ? 1 : 0
+    return returnRows([[count]])
+  }
+
   if sql.contains("FROM processed_svix_ids WHERE svix_id = ?1")
     && sql.contains("SELECT COUNT(*)")
   {
@@ -412,6 +430,33 @@ private func mockDbQueryLocked(sql: String, paramValues: [Any]) -> UnsafePointer
       let entry = mockSvixIds[sid]
     else { return returnRows([]) }
     return returnRows([[entry.status]])
+  }
+
+  if sql.contains("SELECT svix_id, payload FROM processed_svix_ids") {
+    // Stale-claim scan: processing + payload + lease expired, oldest first.
+    let lease = DatabaseManager.svixClaimLeaseSeconds
+    let cutoff = Int(Date().timeIntervalSince1970) - lease
+    let limit = paramValues.first as? Int ?? 16
+    let rows: [[Any]] = mockSvixIds
+      .filter { $0.value.status == "processing" && $0.value.payload != nil }
+      .filter { $0.value.createdAt < cutoff }
+      .sorted { $0.value.createdAt < $1.value.createdAt }
+      .prefix(limit)
+      .map { [$0.key, $0.value.payload!] }
+    return returnRows(rows)
+  }
+
+  if sql.contains("SELECT COUNT(*) FROM processed_svix_ids WHERE status = 'processing'") {
+    let count = mockSvixIds.values.filter { $0.status == "processing" }.count
+    return returnRows([[count]])
+  }
+
+  if sql.contains("unixepoch() - MIN(created_at) FROM processed_svix_ids") {
+    let pending = mockSvixIds.values.filter { $0.status == "processing" }
+    guard let oldest = pending.map(\.createdAt).min() else {
+      return returnRows([[NSNull()]])
+    }
+    return returnRows([[Int(Date().timeIntervalSince1970) - oldest]])
   }
 
   if sql.contains("JOIN messages m ON m.thread_id = t.thread_id")

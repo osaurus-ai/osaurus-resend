@@ -38,9 +38,12 @@ struct WebhookReliabilityTests {
     #expect(claimedCount.value == 1, "exactly one concurrent delivery may win the claim")
   }
 
-  @Test("In-flight claim returns 503 so Svix retries instead of double-processing")
-  func inFlightClaimAsksForRetry() {
+  @Test("In-flight claim WITHOUT a stored payload returns 503 (provider retry is the only recovery)")
+  func inFlightClaimWithoutPayloadAsksForRetry() {
     setUpConfiguredHost()
+    // Claim without payload = pre-Wave-2 row (or a claim made outside the
+    // webhook path). Reconciliation can't reprocess it, so the retry must
+    // not be acked.
     #expect(DatabaseManager.claimSvixId("msg_inflight") == .claimed)
 
     let body =
@@ -48,6 +51,24 @@ struct WebhookReliabilityTests {
     let result = SignedWebhook.send(ctx: PluginContext(), body: body, svixId: "msg_inflight")
     #expect(result.status == 503)
     #expect(mockDispatchCalls.isEmpty)
+  }
+
+  @Test("In-flight claim WITH a stored payload is acked 200 without double-processing")
+  func inFlightClaimWithPayloadAcksWithoutProcessing() {
+    setUpConfiguredHost()
+    // Wave-2 claim: the payload rode along, so the delivery is durably
+    // enqueued and a provider retry must be acked without re-enqueueing.
+    let stored = StoredWebhookPayload(
+      body: "{\"type\":\"email.received\",\"data\":{\"email_id\":\"e-if2\"}}",
+      agent_address: nil)
+    #expect(
+      DatabaseManager.claimSvixId("msg_inflight2", payload: stored.encoded()) == .claimed)
+
+    let body =
+      "{\"type\":\"email.received\",\"data\":{\"email_id\":\"e-if2\",\"from\":\"a@a.com\",\"to\":[\"agent@d.com\"]}}"
+    let result = SignedWebhook.send(ctx: PluginContext(), body: body, svixId: "msg_inflight2")
+    #expect(result.status == 200)
+    #expect(mockDispatchCalls.isEmpty, "an in-lease retry must not double-process")
   }
 
   @Test("Stale in-flight claim (lease expired) is taken over by a redelivery")
@@ -58,7 +79,8 @@ struct WebhookReliabilityTests {
     mockStateLock.lock()
     mockSvixIds["msg_stale"] = (
       status: "processing",
-      createdAt: Int(Date().timeIntervalSince1970) - DatabaseManager.svixClaimLeaseSeconds - 10
+      createdAt: Int(Date().timeIntervalSince1970) - DatabaseManager.svixClaimLeaseSeconds - 10,
+      payload: nil
     )
     mockStateLock.unlock()
 
@@ -67,29 +89,49 @@ struct WebhookReliabilityTests {
 
   // MARK: - Claim completed only after successful processing
 
-  @Test("Transient processing failure returns retryable 503 and redelivery succeeds")
-  func transientFailureAllowsRedelivery() {
+  @Test("Transient processing failure leaves the claim resumable; lease takeover reprocesses")
+  func transientFailureLeavesClaimResumable() {
     setUpConfiguredHost()
+    let ctx = PluginContext()
 
     let body =
       "{\"type\":\"email.received\",\"data\":{\"email_id\":\"e-retry\",\"from\":\"a@a.com\",\"to\":[\"agent@d.com\"],\"message_id\":\"<m-retry>\"}}"
 
-    // First delivery: the receive-API fetch fails (no queued response -> 500),
-    // so the handler must NOT ack with 200 and must NOT burn the svix-id.
-    let first = SignedWebhook.send(ctx: PluginContext(), body: body, svixId: "msg_retry_001")
-    #expect(first.status == 503, "transient failure must surface as retryable 5xx")
-    #expect(mockDispatchCalls.isEmpty)
+    // First delivery: the receive-API fetch fails (no queued response -> 500).
+    // Wave 2 contract: the 200 already reflects the durable enqueue; the
+    // worker's failure leaves the claim `processing` (payload intact) so
+    // reconciliation reprocesses it after the lease expires.
+    let first = SignedWebhook.send(ctx: ctx, body: body, svixId: "msg_retry_001")
+    #expect(first.status == 200, "the durably enqueued delivery must be acked")
+    #expect(mockDispatchCalls.isEmpty, "the fetch failed, nothing may dispatch")
+    #expect(ctx.lastProcessingError() != nil, "worker failure must be recorded for /health")
 
-    // Redelivery with the same svix-id: fetch succeeds now, processing completes.
+    // Redelivery while the failed claim is inside its lease: acked without
+    // re-processing (the payload is already durably queued).
+    let inLease = SignedWebhook.send(ctx: ctx, body: body, svixId: "msg_retry_001")
+    #expect(inLease.status == 200)
+    #expect(mockDispatchCalls.isEmpty, "an in-lease retry must not re-enqueue")
+
+    // Age the claim past the lease (crashed worker) and let a redelivery
+    // take it over: fetch succeeds now, processing completes.
+    mockStateLock.lock()
+    if let entry = mockSvixIds["msg_retry_001"] {
+      mockSvixIds["msg_retry_001"] = (
+        status: entry.status,
+        createdAt: Int(Date().timeIntervalSince1970) - DatabaseManager.svixClaimLeaseSeconds - 10,
+        payload: entry.payload
+      )
+    }
+    mockStateLock.unlock()
     MockHost.pushReceivedEmailResponse(
       emailId: "e-retry", from: "a@a.com", to: ["agent@d.com"],
       subject: "retry", text: "hello", html: nil, messageId: "<m-retry>")
-    let second = SignedWebhook.send(ctx: PluginContext(), body: body, svixId: "msg_retry_001")
+    let second = SignedWebhook.send(ctx: ctx, body: body, svixId: "msg_retry_001")
     #expect(second.status == 200)
-    #expect(mockDispatchCalls.count == 1, "redelivery after transient failure must process")
+    #expect(mockDispatchCalls.count == 1, "lease takeover must re-process the delivery")
 
     // Third delivery is a true duplicate of the completed one.
-    let third = SignedWebhook.send(ctx: PluginContext(), body: body, svixId: "msg_retry_001")
+    let third = SignedWebhook.send(ctx: ctx, body: body, svixId: "msg_retry_001")
     #expect(third.status == 200)
     #expect(mockDispatchCalls.count == 1, "completed delivery must not re-process")
   }
