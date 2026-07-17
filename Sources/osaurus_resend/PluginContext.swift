@@ -12,6 +12,32 @@ final class PluginContext: @unchecked Sendable {
   let listThreadsTool = ResendListThreadsTool()
   let getThreadTool = ResendGetThreadTool()
   let labelThreadTool = ResendLabelThreadTool()
+
+  /// Background webhook worker (Wave 2): drains claimed deliveries off the
+  /// request path. Owned here so its lifetime matches the plugin's.
+  let webhookWorker = WebhookWorkQueue()
+
+  // MARK: - Processing-error health state (Wave 2)
+  //
+  // Written by worker threads, read by the in-frame `/health` handler.
+  // In-memory only: "last processing error" is defined since plugin load.
+  private let healthLock = NSLock()
+  private var lastErrorMessage: String?
+  private var lastErrorAt: Int?
+
+  func recordProcessingError(_ message: String) {
+    healthLock.lock()
+    defer { healthLock.unlock() }
+    lastErrorMessage = message
+    lastErrorAt = Int(Date().timeIntervalSince1970)
+  }
+
+  func lastProcessingError() -> (message: String, at: Int)? {
+    healthLock.lock()
+    defer { healthLock.unlock() }
+    guard let lastErrorMessage, let lastErrorAt else { return nil }
+    return (lastErrorMessage, lastErrorAt)
+  }
 }
 
 // MARK: - Webhook Constants
@@ -28,10 +54,16 @@ func initPlugin(_ ctx: PluginContext) {
   logDebug("initPlugin: starting")
   DatabaseManager.initSchema()
 
-  // Pure DB + state restore. Reconciliation lives in `onConfigChanged`: init
-  // runs without an active agent context, and the host force-redelivers
-  // `tunnel_url` post-init (and on every tunnel reconnect) anyway.
+  // Pure DB + state restore. Webhook reconciliation lives in
+  // `onConfigChanged`: init runs without an active agent context, and the
+  // host force-redelivers `tunnel_url` post-init (and on every tunnel
+  // reconnect) anyway.
   ctx.tunnelURL = configGet("tunnel_url")
+
+  // Startup reconciliation (Wave 2): claims a previous plugin load left
+  // `processing` (crash mid-drain) are reprocessed from their stored
+  // payloads once the lease has expired.
+  triggerSvixReconciliation(ctx: ctx)
   logInfo("initPlugin: ready (waiting for config push)")
 }
 

@@ -58,6 +58,12 @@ private func validateRequest(
 
 // MARK: - Webhook Endpoint
 
+/// Hot path (Wave 2: claim-then-async-drain). The handler verifies the
+/// Svix signature, parses the event, and atomically claims the svix-id
+/// into the inbox with the raw payload persisted in the SAME statement
+/// (durable-first); the receive-API fetch + dispatch happen on the
+/// background worker. Wave 1's 503-on-transient is kept for the enqueue
+/// step itself (`.storeUnavailable`).
 private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
   guard let body = req.body, !body.isEmpty else {
     logWarn("handleWebhook: empty body")
@@ -79,50 +85,83 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
     return makeRouteResponse(status: 503, body: "{\"error\":\"Webhook not configured yet\"}")
   }
 
+  // Every authenticated webhook doubles as the recovery heartbeat: kick a
+  // reconciliation pass for stale claims. Cheap on the request path — the
+  // actual reprocessing runs on the worker.
+  triggerSvixReconciliation(ctx: ctx)
+
   guard let event = parseJSON(body, as: ResendWebhookEvent.self) else {
     logWarn("handleWebhook: failed to parse event")
     return makeRouteResponse(status: 200, body: "ok")
   }
+  logDebug("handleWebhook: type=\(event.type) email_id=\(event.data.email_id)")
 
-  // 2. Claim the delivery id (atomic). Completed ids are duplicates and get
-  //    200; an in-flight claim means a parallel delivery is still processing,
-  //    so ask Svix to retry later rather than double-process.
-  if let svixId, !svixId.isEmpty {
-    switch DatabaseManager.claimSvixId(svixId) {
-    case .claimed: break
-    case .alreadyCompleted:
-      logDebug("handleWebhook: skipping duplicate svix-id=\(svixId)")
+  let stored = StoredWebhookPayload(body: body, agent_address: req.osaurus?.agent_address)
+
+  // 2. Deliveries without a svix-id have no dedupe/enqueue key, so there is
+  //    nothing to durably claim against: process synchronously exactly like
+  //    wave 1 (200 on success, retryable 503 on transient failure). Real
+  //    Svix deliveries always carry the id; this is a defensive path.
+  guard let svixId, !svixId.isEmpty else {
+    switch processWebhookEvent(
+      ctx: ctx, event: event, body: body, agentAddress: stored.agent_address)
+    {
+    case .success:
       return makeRouteResponse(status: 200, body: "ok")
-    case .inFlight:
-      logDebug("handleWebhook: svix-id=\(svixId) still in flight, asking for retry")
-      return makeRouteResponse(status: 503, body: "{\"error\":\"Delivery is being processed\"}")
+    case .transientFailure(let reason):
+      logWarn("handleWebhook: transient failure (\(reason)), requesting redelivery")
+      ctx.recordProcessingError(reason)
+      return makeRouteResponse(status: 503, body: "{\"error\":\"Processing failed, retry\"}")
     }
   }
 
-  logDebug("handleWebhook: type=\(event.type) email_id=\(event.data.email_id)")
-  // 3. Only mark completed after successful processing. Transient failures
-  //    release the claim and return a retryable 5xx so Svix redelivers.
-  switch dispatchEvent(event: event, body: body, req: req, ctx: ctx) {
-  case .success:
-    if let svixId, !svixId.isEmpty { DatabaseManager.completeSvixId(svixId) }
+  // 3. Atomically claim + durably persist, then hand off to the worker.
+  switch DatabaseManager.claimSvixId(svixId, payload: stored.encoded()) {
+  case .claimed:
+    ctx.webhookWorker.enqueue {
+      processClaimedDelivery(ctx: ctx, svixId: svixId, stored: stored)
+    }
     return makeRouteResponse(status: 200, body: "ok")
-  case .transientFailure(let reason):
-    logWarn("handleWebhook: transient failure (\(reason)), requesting redelivery")
-    if let svixId, !svixId.isEmpty { DatabaseManager.releaseSvixId(svixId) }
-    return makeRouteResponse(status: 503, body: "{\"error\":\"Processing failed, retry\"}")
+
+  case .alreadyCompleted:
+    logDebug("handleWebhook: skipping duplicate svix-id=\(svixId)")
+    return makeRouteResponse(status: 200, body: "ok")
+
+  case .inFlight:
+    // In-lease claim. With a stored payload the delivery is already durably
+    // queued (or awaiting reconciliation): ack 200 and MUST NOT enqueue
+    // again — that would double-process. Without one (pre-Wave-2 row, or a
+    // claim made outside the webhook path) only the provider's retry can
+    // recover the event, so keep wave 1's retryable 503.
+    if DatabaseManager.svixClaimHasPayload(svixId) {
+      logDebug("handleWebhook: svix-id=\(svixId) already durably enqueued, 200 OK")
+      return makeRouteResponse(status: 200, body: "ok")
+    }
+    logDebug("handleWebhook: svix-id=\(svixId) in flight without payload, asking for retry")
+    return makeRouteResponse(status: 503, body: "{\"error\":\"Delivery is being processed\"}")
+
+  case .storeUnavailable:
+    // The claim could not be durably recorded. Durable-first forbids acking
+    // here — 503 keeps Svix's retry as the recovery mechanism for the
+    // enqueue step itself (the wave-1 contract).
+    logWarn("handleWebhook: claim store unavailable for svix-id=\(svixId)")
+    return makeRouteResponse(status: 503, body: "{\"error\":\"Delivery could not be recorded\"}")
   }
 }
 
 /// Outcome of processing one webhook event. Permanent conditions (unauthorized
 /// sender, unknown event type, duplicates) count as `success` so the provider
 /// stops redelivering; `transientFailure` means a retry may succeed.
-private enum ProcessingOutcome {
+enum ProcessingOutcome {
   case success
   case transientFailure(String)
 }
 
-private func dispatchEvent(
-  event: ResendWebhookEvent, body: String, req: RouteRequest, ctx: PluginContext
+/// Worker-side event processing (Wave 2): everything that used to run
+/// synchronously after the claim. Runs on the drain lane for claimed
+/// deliveries; also runs inline for the defensive no-svix-id path.
+func processWebhookEvent(
+  ctx: PluginContext, event: ResendWebhookEvent, body: String, agentAddress: String?
 ) -> ProcessingOutcome {
   switch event.type {
   case "email.received":
@@ -132,7 +171,7 @@ private func dispatchEvent(
       return .success
     }
     return processInboundEmail(
-      ctx: ctx, eventData: event.data, agentAddress: req.osaurus?.agent_address)
+      ctx: ctx, eventData: event.data, agentAddress: agentAddress)
   case "email.bounced":
     let reason = event.data.bounce_message ?? "bounced"
     handleSuppressionEvent(
@@ -739,9 +778,30 @@ func handleArtifactShare(ctx: PluginContext, payload: String) -> String {
 
 // MARK: - Health & Reset Endpoints
 
+/// GET /health (Wave 2): reports the async-drain inbox alongside webhook
+/// registration status. `ok` means "registered and nothing stuck": a
+/// pending claim older than the lease indicates a wedged/failed worker
+/// awaiting reconciliation.
 private func handleHealth(ctx: PluginContext) -> String {
   let registered = configGet("webhook_registered") == "true"
-  let body = makeJSONString(["ok": registered, "webhook_registered": registered]) ?? "{}"
+  let queueDepth = DatabaseManager.pendingSvixClaimCount()
+  let oldestAge = DatabaseManager.oldestPendingSvixClaimAge()
+
+  var payload: [String: Any] = [
+    "webhook_registered": registered,
+    "queue_depth": queueDepth,
+    "oldest_pending_claim_age_seconds": oldestAge ?? NSNull(),
+  ]
+  if let lastError = ctx.lastProcessingError() {
+    payload["last_processing_error"] = lastError.message
+    payload["last_processing_error_at"] = lastError.at
+  } else {
+    payload["last_processing_error"] = NSNull()
+  }
+  payload["ok"] =
+    registered && (oldestAge ?? 0) <= DatabaseManager.svixClaimLeaseSeconds
+
+  let body = makeJSONString(payload) ?? "{}"
   return makeRouteResponse(status: 200, body: body, contentType: "application/json")
 }
 

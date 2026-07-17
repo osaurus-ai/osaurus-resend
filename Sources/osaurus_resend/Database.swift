@@ -108,6 +108,17 @@ enum DatabaseManager {
         params: "[]")
     }
 
+    // Migration (Wave 2): the claim row now also carries the raw webhook
+    // payload, persisted atomically with the claim so "claimed" always
+    // implies "durably enqueued" for the async drain worker.
+    let hasPayloadColumn =
+      queryScalarInt(
+        "SELECT COUNT(*) FROM pragma_table_info('processed_svix_ids') WHERE name = 'payload'",
+        values: []) > 0
+    if !hasPayloadColumn {
+      dbExec("ALTER TABLE processed_svix_ids ADD COLUMN payload TEXT", params: "[]")
+    }
+
     // Best-effort GC of replay-protection rows older than 30 days.
     dbExec(
       "DELETE FROM processed_svix_ids WHERE created_at < (unixepoch() - 2592000)",
@@ -385,55 +396,137 @@ enum DatabaseManager {
 
   // MARK: - Svix Replay Protection
 
-  enum SvixClaim {
+  enum SvixClaim: Equatable {
     /// This delivery is ours to process (fresh id, or takeover of a stale claim).
     case claimed
     /// A previous delivery of this id was fully processed; skip with 200.
     case alreadyCompleted
-    /// Another in-flight claim holds the lease; retry later with 503.
+    /// Another in-flight claim holds the lease (or the claim awaits
+    /// reconciliation). Since Wave 2 the payload is stored with the claim,
+    /// so retries are acked 200 without enqueueing again.
     case inFlight
+    /// The claim could not be durably recorded (host DB unavailable).
+    /// Durable-first: the webhook must answer 5xx so the provider's retry
+    /// remains the recovery path for the enqueue step itself.
+    case storeUnavailable
   }
 
   /// A `processing` claim older than this is considered abandoned (crashed or
-  /// hung worker) and may be taken over by a redelivery.
+  /// hung worker) and may be taken over by a redelivery or reconciliation.
   static let svixClaimLeaseSeconds = 300
 
   /// Atomically claims a Svix delivery id for processing. The claim is a
   /// single INSERT with an affected-row check: fresh ids insert a `processing`
   /// row, stale `processing` rows (lease expired) are re-claimed, and anything
   /// else leaves the row untouched (0 rows affected).
-  static func claimSvixId(_ svixId: String) -> SvixClaim {
+  ///
+  /// `payload` (Wave 2) is the raw signed webhook body, persisted in the SAME
+  /// statement as the claim so "claimed" always implies "durably enqueued" —
+  /// there is no window where a crash loses the event after the 200 went out.
+  /// Pass nil to preserve whatever payload the row already carries (lease
+  /// takeover keeps the original delivery's body).
+  static func claimSvixId(_ svixId: String, payload: String? = nil) -> SvixClaim {
     let sql = """
-      INSERT INTO processed_svix_ids (svix_id, status, created_at)
-      VALUES (?1, 'processing', unixepoch())
-      ON CONFLICT(svix_id) DO UPDATE SET created_at = unixepoch()
+      INSERT INTO processed_svix_ids (svix_id, status, created_at, payload)
+      VALUES (?1, 'processing', unixepoch(), ?2)
+      ON CONFLICT(svix_id) DO UPDATE SET
+          created_at = unixepoch(),
+          payload = COALESCE(?2, processed_svix_ids.payload)
         WHERE processed_svix_ids.status = 'processing'
           AND processed_svix_ids.created_at < (unixepoch() - \(svixClaimLeaseSeconds))
       """
-    if dbExec(sql, params: serializeParams([svixId])) > 0 {
+    if dbExec(sql, params: serializeParams([svixId, payload ?? NSNull()])) > 0 {
       return .claimed
     }
-    let status =
-      queryFirstRow(
+    guard
+      let row = queryFirstRow(
         "SELECT status FROM processed_svix_ids WHERE svix_id = ?1",
-        values: [svixId])?.first as? String
+        values: [svixId]),
+      let status = row.first as? String
+    else {
+      // INSERT affected nothing AND no row is readable — the write itself
+      // failed (DB unavailable / error), not a claim conflict.
+      return .storeUnavailable
+    }
     return status == "completed" ? .alreadyCompleted : .inFlight
   }
 
   /// Marks a claimed delivery as fully processed. Only after this call do
-  /// duplicate deliveries get skipped.
+  /// duplicate deliveries get skipped. Drops the stored payload — it is
+  /// only needed while the claim is resumable.
   static func completeSvixId(_ svixId: String) {
     dbExec(
-      "UPDATE processed_svix_ids SET status = 'completed' WHERE svix_id = ?1",
+      "UPDATE processed_svix_ids SET status = 'completed', payload = NULL WHERE svix_id = ?1",
       params: serializeParams([svixId]))
   }
 
-  /// Releases a claim after a transient processing failure so the provider's
-  /// retry can re-claim immediately instead of waiting out the lease.
-  static func releaseSvixId(_ svixId: String) {
-    dbExec(
-      "DELETE FROM processed_svix_ids WHERE svix_id = ?1 AND status = 'processing'",
-      params: serializeParams([svixId]))
+  // NOTE: Wave 1's `releaseSvixId` (DELETE on transient failure so the
+  // provider's retry re-claims immediately) was removed in Wave 2: the 200
+  // already went out at enqueue time, so deleting the row would orphan the
+  // event if the provider never redelivers. Failed claims now stay
+  // `processing` and are reprocessed from the stored payload once the lease
+  // expires.
+
+  /// One resumable inbox row: a `processing` claim whose lease expired and
+  /// whose raw payload is still available for reprocessing.
+  struct StaleClaimRow {
+    let svixId: String
+    let payload: String
+  }
+
+  /// `processing` claims older than the lease that still carry a payload —
+  /// i.e. events a crashed/failed worker left behind. Ordered oldest first
+  /// so reconciliation drains in arrival order. Rows without a payload
+  /// (pre-Wave-2, or claims from deliveries lacking a svix-id) are skipped:
+  /// there is nothing to reprocess, and they age out via the 30-day GC.
+  static func staleIncompleteSvixClaims(limit: Int = 16) -> [StaleClaimRow] {
+    let sql = """
+      SELECT svix_id, payload FROM processed_svix_ids
+      WHERE status = 'processing' AND payload IS NOT NULL
+        AND created_at < (unixepoch() - \(svixClaimLeaseSeconds))
+      ORDER BY created_at ASC
+      LIMIT ?1
+      """
+    return queryRows(sql, values: [limit]).compactMap { row in
+      guard row.count >= 2, let svixId = row[0] as? String,
+        let payload = row[1] as? String
+      else { return nil }
+      return StaleClaimRow(svixId: svixId, payload: payload)
+    }
+  }
+
+  /// Whether a claim row still carries its durable payload. Used by the
+  /// webhook handler to distinguish a wave-2 in-flight claim (payload
+  /// stored, safe to ack 200) from a payload-less one (pre-Wave-2 row or
+  /// synthetic claim), where only the provider's retry can recover.
+  static func svixClaimHasPayload(_ svixId: String) -> Bool {
+    queryScalarInt(
+      "SELECT COUNT(*) FROM processed_svix_ids WHERE svix_id = ?1 AND payload IS NOT NULL",
+      values: [svixId]) > 0
+  }
+
+  /// Queue depth for `/health`: claims not yet completed (in-lease =
+  /// queued/processing, lease-expired = awaiting reconciliation).
+  static func pendingSvixClaimCount() -> Int {
+    queryScalarInt(
+      "SELECT COUNT(*) FROM processed_svix_ids WHERE status = 'processing'",
+      values: [])
+  }
+
+  /// Age (seconds) of the oldest not-yet-completed claim, or nil when the
+  /// queue is empty. Surfaced by `/health` so a wedged worker shows up as a
+  /// growing age even while the depth stays flat.
+  static func oldestPendingSvixClaimAge() -> Int? {
+    guard
+      let row = queryFirstRow(
+        """
+        SELECT unixepoch() - MIN(created_at) FROM processed_svix_ids
+        WHERE status = 'processing'
+        """,
+        values: []),
+      let age = row.first as? Int
+    else { return nil }
+    return age
   }
 
   // MARK: - Query Helpers
