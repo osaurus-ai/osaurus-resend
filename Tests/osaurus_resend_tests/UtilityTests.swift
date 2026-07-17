@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Utilities", .serialized)
 struct UtilityTests {
 
@@ -100,4 +101,5 @@ struct UtilityTests {
     let result = extractEmailAddress("\"Alice Smith\" <alice@example.com>")
     #expect(result == "alice@example.com")
   }
+}
 }

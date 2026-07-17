@@ -4,6 +4,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Webhook Signature Verification", .serialized)
 struct WebhookSignatureTests {
 
@@ -254,6 +255,7 @@ struct WebhookSignatureTests {
     #expect(parsed.status == 200)
     #expect(mockDispatchCalls.count == 1)
   }
+}
 }
 
 // MARK: - Local helpers (avoid colliding with WebhookTests private helpers)

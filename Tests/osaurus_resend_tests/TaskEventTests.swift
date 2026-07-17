@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Task Event Handling", .serialized)
 struct TaskEventTests {
 
@@ -482,4 +483,5 @@ struct InboundFollowupTests {
     #expect(a != c)
     #expect(UUID(uuidString: a) != nil)
   }
+}
 }

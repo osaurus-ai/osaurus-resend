@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Manifest")
 struct ManifestTests {
 
@@ -91,4 +92,5 @@ struct EnvelopeTests {
     #expect(obj["message"] as? String == messy)
     #expect(obj["kind"] as? String == "execution_error")
   }
+}
 }

@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Database Operations", .serialized)
 struct DatabaseTests {
 
@@ -264,4 +265,5 @@ struct DatabaseTests {
     #expect(
       DatabaseManager.hasOutboundMessageSince(threadId: "t-ts", sinceTimestamp: now + 10) == false)
   }
+}
 }

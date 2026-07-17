@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Lifecycle Events", .serialized)
 struct LifecycleEventTests {
 
@@ -174,4 +175,5 @@ struct LifecycleEventTests {
     #expect(parse(r2) == 200)
     #expect(mockDispatchCalls.count == 1, "Same svix-id must dispatch exactly once")
   }
+}
 }

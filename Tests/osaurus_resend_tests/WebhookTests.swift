@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Webhook & Route Handling", .serialized)
 struct WebhookTests {
 
@@ -321,6 +322,7 @@ struct WebhookTests {
     let parsed = parseRouteResponse(result)
     #expect(parsed.status == 200)
   }
+}
 }
 
 // MARK: - Helpers

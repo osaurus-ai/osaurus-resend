@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Resend API Resilience", .serialized)
 struct ResendAPIResilienceTests {
 
@@ -122,4 +123,5 @@ struct ResendAPIResilienceTests {
     #expect(elapsedMs >= 200, "throttle should impose ~5*50ms of spacing, got \(elapsedMs)ms")
     #expect(parsedRequests().count == 6)
   }
+}
 }

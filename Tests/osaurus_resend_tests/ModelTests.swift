@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Model Decoding", .serialized)
 struct ModelTests {
 
@@ -151,4 +152,5 @@ struct ModelTests {
     #expect(resp?.id == "task-abc")
     #expect(resp?.status == "running")
   }
+}
 }
