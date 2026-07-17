@@ -57,8 +57,8 @@ struct EnvelopeTests {
     #expect(obj["ok"] as? Bool == false)
     #expect(obj["kind"] as? String == "invalid_args")
     #expect(obj["message"] as? String == "bad input")
-    // invalid_args defaults to retryable == true.
-    #expect(obj["retryable"] as? Bool == true)
+    // invalid_args is deterministic and defaults to retryable == false.
+    #expect(obj["retryable"] as? Bool == false)
   }
 
   @Test("default retryable per kind")
@@ -68,7 +68,7 @@ struct EnvelopeTests {
       let obj = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
       return try #require(obj["retryable"] as? Bool)
     }
-    #expect(try retryable(.invalidArgs) == true)
+    #expect(try retryable(.invalidArgs) == false)
     #expect(try retryable(.executionError) == true)
     #expect(try retryable(.unavailable) == true)
     #expect(try retryable(.notFound) == false)

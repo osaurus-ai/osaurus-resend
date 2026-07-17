@@ -30,8 +30,9 @@ enum Envelope {
 
   private static func defaultRetryable(for kind: Kind) -> Bool {
     switch kind {
-    case .invalidArgs, .executionError, .unavailable: return true
-    case .notFound: return false
+    case .executionError, .unavailable: return true
+    // Deterministic validation/lookup failures never succeed on retry.
+    case .invalidArgs, .notFound: return false
     }
   }
 
