@@ -1,5 +1,9 @@
 import Foundation
 
+/// Single source of truth for the plugin version. Embedded in the manifest and
+/// used to derive the outbound `User-Agent`. Must match `osaurus-plugin.json`.
+let resendPluginVersion = "1.3.1"
+
 /// The plugin manifest, returned verbatim from `get_manifest`. Kept as a
 /// file-scope constant (rather than inline in the C-ABI builder closure) so it
 /// is a single source of truth that tests can parse directly.
@@ -7,7 +11,7 @@ let resendManifestJSON = """
   {
     "plugin_id": "osaurus.resend",
     "name": "Resend (Email)",
-    "version": "0.2.0",
+    "version": "\(resendPluginVersion)",
     "description": "Send, receive, and manage email through Resend",
     "instructions": "You have access to email via the Resend plugin. This is asynchronous email communication, not instant messaging. Write complete, professional, self-contained responses -- the recipient may not read your reply for hours or days. Every response should be thorough enough to stand on its own without requiring immediate follow-up.\\n\\nWhen you receive an inbound email, the thread_id is provided in the prompt. Use resend_reply with that thread_id to respond. The reply is sent to all thread participants by default (reply-all). If you need to reply only to a specific person, pass the to parameter.\\n\\nTo compose a new email to someone not in the current thread, use resend_send. This creates a new thread and authorizes the recipient for future replies.\\n\\nTo review past conversations, use resend_list_threads (filterable by participant or label) for summaries, and resend_get_thread for full message bodies. Use resend_label_thread to tag threads for organization (e.g. scheduling, invoices, urgent).\\n\\nIf a follow-up email arrives on the same thread while you are still working, the new message is appended to your conversation automatically and you should incorporate it into a single coherent reply rather than answering each email separately. The thread retains its full history across resumes, so feel free to call resend_get_thread when you need to refresh context.\\n\\nIf the email-system reports a send failure (e.g. bounce, suppression), reconsider the recipient and either correct the address, pick a different person, or stop trying to email that destination -- do not retry the same address.\\n\\nWhen producing files during a task, they are automatically attached to your next reply. You do not need to handle attachments manually.",
     "license": "MIT",
