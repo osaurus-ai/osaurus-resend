@@ -610,42 +610,48 @@ private func returnRows(_ rows: [[Any]]) -> UnsafePointer<CChar>? {
   return mockStr(str)
 }
 
+// Rows are built with per-element appends: large heterogeneous `[Any]`
+// literals with `??` chains exceed the type-checker budget on CI runners.
+private func columnValue(_ dict: [String: Any], _ key: String, default def: Any = NSNull()) -> Any {
+  dict[key] ?? def
+}
+
 private func returnThreadRows(_ threads: [[String: Any]]) -> UnsafePointer<CChar>? {
   let rows: [[Any]] = threads.map { t in
-    [
-      t["thread_id"] ?? NSNull(),
-      t["subject"] ?? NSNull(),
-      t["participants"] ?? "[]",
-      t["last_message_id"] ?? NSNull(),
-      t["refs"] ?? NSNull(),
-      t["task_id"] ?? NSNull(),
-      t["labels"] ?? "[]",
-      t["created_at"] ?? NSNull(),
-      t["updated_at"] ?? NSNull(),
-    ]
+    var row: [Any] = []
+    row.append(columnValue(t, "thread_id"))
+    row.append(columnValue(t, "subject"))
+    row.append(columnValue(t, "participants", default: "[]"))
+    row.append(columnValue(t, "last_message_id"))
+    row.append(columnValue(t, "refs"))
+    row.append(columnValue(t, "task_id"))
+    row.append(columnValue(t, "labels", default: "[]"))
+    row.append(columnValue(t, "created_at"))
+    row.append(columnValue(t, "updated_at"))
+    return row
   }
   return returnRows(rows)
 }
 
 private func returnMessageRows(_ messages: [[String: Any]]) -> UnsafePointer<CChar>? {
   let rows: [[Any]] = messages.map { m in
-    [
-      m["id"] ?? NSNull(),
-      m["thread_id"] ?? NSNull(),
-      m["email_id"] ?? NSNull(),
-      m["direction"] ?? NSNull(),
-      m["from_address"] ?? NSNull(),
-      m["to_address"] ?? "[]",
-      m["cc_address"] ?? "[]",
-      m["bcc_address"] ?? "[]",
-      m["subject"] ?? NSNull(),
-      m["body_text"] ?? NSNull(),
-      m["body_html"] ?? NSNull(),
-      m["message_id"] ?? NSNull(),
-      m["in_reply_to"] ?? NSNull(),
-      m["has_attachments"] ?? 0,
-      m["created_at"] ?? NSNull(),
-    ]
+    var row: [Any] = []
+    row.append(columnValue(m, "id"))
+    row.append(columnValue(m, "thread_id"))
+    row.append(columnValue(m, "email_id"))
+    row.append(columnValue(m, "direction"))
+    row.append(columnValue(m, "from_address"))
+    row.append(columnValue(m, "to_address", default: "[]"))
+    row.append(columnValue(m, "cc_address", default: "[]"))
+    row.append(columnValue(m, "bcc_address", default: "[]"))
+    row.append(columnValue(m, "subject"))
+    row.append(columnValue(m, "body_text"))
+    row.append(columnValue(m, "body_html"))
+    row.append(columnValue(m, "message_id"))
+    row.append(columnValue(m, "in_reply_to"))
+    row.append(columnValue(m, "has_attachments", default: 0))
+    row.append(columnValue(m, "created_at"))
+    return row
   }
   return returnRows(rows)
 }
