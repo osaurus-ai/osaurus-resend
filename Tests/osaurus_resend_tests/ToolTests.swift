@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Tools", .serialized)
 struct ToolTests {
 
@@ -308,4 +309,5 @@ struct ToolTests {
     #expect(result.contains("new_label"))
     #expect(!result.contains("old_label"))
   }
+}
 }

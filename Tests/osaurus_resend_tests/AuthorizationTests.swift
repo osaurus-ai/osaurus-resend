@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Authorization", .serialized)
 struct AuthorizationTests {
 
@@ -145,4 +146,5 @@ struct AuthorizationTests {
     mockConfig["allowed_senders"] = ""
     #expect(isAuthorized(sender: "new@person.com") == false)
   }
+}
 }

@@ -1,4 +1,5 @@
 import Foundation
+import OsaurusPluginABI
 
 @testable import osaurus_resend
 
@@ -26,13 +27,20 @@ nonisolated(unsafe) var mockDispatchCalls: [String] = []
 nonisolated(unsafe) var mockDispatchResult: String = "{\"id\":\"task-001\",\"status\":\"running\"}"
 nonisolated(unsafe) var mockFileContents: [String: String] = [:]
 nonisolated(unsafe) var mockLogMessages: [(Int32, String)] = []
-nonisolated(unsafe) var mockHostAPIStorage = osr_host_api()
+nonisolated(unsafe) var mockHostAPIStorage = OsrHostAPI()
 
 // MARK: - MockHost Setup
 
 nonisolated(unsafe) var mockSuppressedAddresses: [String: (reason: String, createdAt: Int)] = [:]
 nonisolated(unsafe) var mockEmailEvents: [(emailId: String, type: String, detail: String?)] = []
-nonisolated(unsafe) var mockSvixIds: Set<String> = []
+nonisolated(unsafe) var mockSvixIds:
+  [String: (status: String, createdAt: Int, payload: String?)] = [:]
+
+/// When true, INSERTs into processed_svix_ids affect 0 rows and the row is
+/// not recorded — simulating a host whose database layer is unavailable.
+/// Durable-first tests use this to verify the webhook refuses to ack
+/// un-persisted deliveries.
+nonisolated(unsafe) var mockFailSvixInserts = false
 nonisolated(unsafe) var mockAddIssueCalls: [(taskId: String, payload: String)] = []
 nonisolated(unsafe) var mockDispatchInterruptCalls: [(taskId: String, message: String)] = []
 
@@ -51,9 +59,16 @@ enum MockHost {
       mockLogMessages = []
       mockSuppressedAddresses = [:]
       mockEmailEvents = []
-      mockSvixIds = []
+      mockSvixIds = [:]
+      mockFailSvixInserts = false
       mockAddIssueCalls = []
       mockDispatchInterruptCalls = []
+
+      // Webhook worker runs inline by default so the existing synchronous
+      // suites can assert right after `handleRoute` returns. Async-drain
+      // regression tests flip this off and synchronize via
+      // `ctx.webhookWorker.waitUntilIdle()`.
+      WebhookWorkQueue.executeInlineForTesting = true
 
       // Make the resend retry/backoff loop instantaneous in tests so 429/5xx
       // exploration doesn't sleep for seconds.
@@ -62,7 +77,12 @@ enum MockHost {
       // they're explicitly verifying rate-limit behavior.
       resendThrottleIntervalOverrideMs = 0
 
-      mockHostAPIStorage = osr_host_api()
+      // SDK `OsrHostAPI` struct, populated exactly like the real host's
+      // exec contract. Version stays 2 (what these tests always mocked);
+      // trailing v3+ slots stay nil, which is precisely how an older host
+      // presents to a newer plugin — HostBridge then falls back to libc
+      // free() for host strings, pairing with `mockStr`'s strdup.
+      mockHostAPIStorage = OsrHostAPI()
       mockHostAPIStorage.version = 2
       mockHostAPIStorage.config_get = mockConfigGet
       mockHostAPIStorage.config_set = mockConfigSet
@@ -77,7 +97,11 @@ enum MockHost {
       mockHostAPIStorage.dispatch_interrupt = mockDispatchInterrupt
 
       withUnsafePointer(to: &mockHostAPIStorage) { ptr in
+        // Same injection path as production: raw pointer for the slots the
+        // bridge doesn't cover (db/http/dispatch/file_read), plus
+        // HostBridge for config/log/free.
         hostAPI = ptr
+        HostBridge.shared.install(ptr)
       }
     }
   }
@@ -136,7 +160,7 @@ enum MockHost {
 
 // MARK: - C Callbacks
 
-private let mockConfigGet: osr_config_get_fn = { keyPtr in
+private let mockConfigGet: OsrConfigGetFn = { keyPtr in
   guard let keyPtr else { return nil }
   let key = String(cString: keyPtr)
   return withMockLock {
@@ -145,7 +169,7 @@ private let mockConfigGet: osr_config_get_fn = { keyPtr in
   }
 }
 
-private let mockConfigSet: osr_config_set_fn = { keyPtr, valuePtr in
+private let mockConfigSet: OsrConfigSetFn = { keyPtr, valuePtr in
   guard let keyPtr else { return }
   let key = String(cString: keyPtr)
   if let valuePtr {
@@ -154,19 +178,19 @@ private let mockConfigSet: osr_config_set_fn = { keyPtr, valuePtr in
   }
 }
 
-private let mockConfigDelete: osr_config_delete_fn = { keyPtr in
+private let mockConfigDelete: OsrConfigDeleteFn = { keyPtr in
   guard let keyPtr else { return }
   let key = String(cString: keyPtr)
   withMockLock { _ = mockConfig.removeValue(forKey: key) }
 }
 
-private let mockLog: osr_log_fn = { level, msgPtr in
+private let mockLog: OsrLogFn = { level, msgPtr in
   guard let msgPtr else { return }
   let msg = String(cString: msgPtr)
   withMockLock { mockLogMessages.append((level, msg)) }
 }
 
-private let mockHttpRequest: osr_http_request_fn = { requestPtr in
+private let mockHttpRequest: OsrHttpRequestFn = { requestPtr in
   let request = requestPtr.map { String(cString: $0) }
   return withMockLock {
     if let request { mockHTTPRequests.append(request) }
@@ -178,7 +202,7 @@ private let mockHttpRequest: osr_http_request_fn = { requestPtr in
   }
 }
 
-private let mockDispatch: osr_dispatch_fn = { requestPtr in
+private let mockDispatch: OsrDispatchFn = { requestPtr in
   if let requestPtr {
     let req = String(cString: requestPtr)
     withMockLock { mockDispatchCalls.append(req) }
@@ -187,7 +211,7 @@ private let mockDispatch: osr_dispatch_fn = { requestPtr in
   return mockStr(result)
 }
 
-private let mockFileRead: osr_file_read_fn = { pathPtr in
+private let mockFileRead: OsrFileReadFn = { pathPtr in
   guard let pathPtr else { return nil }
   let path = String(cString: pathPtr)
   let content = withMockLock { mockFileContents[path] }
@@ -198,7 +222,7 @@ private let mockFileRead: osr_file_read_fn = { pathPtr in
   return mockStr(content)
 }
 
-private let mockDispatchAddIssue: osr_dispatch_add_issue_fn = { taskPtr, payloadPtr in
+private let mockDispatchAddIssue: OsrDispatchAddIssueFn = { taskPtr, payloadPtr in
   guard let taskPtr, let payloadPtr else { return nil }
   let taskId = String(cString: taskPtr)
   let payload = String(cString: payloadPtr)
@@ -206,7 +230,7 @@ private let mockDispatchAddIssue: osr_dispatch_add_issue_fn = { taskPtr, payload
   return mockStr("{\"ok\":true}")
 }
 
-private let mockDispatchInterrupt: osr_dispatch_interrupt_fn = { taskPtr, msgPtr in
+private let mockDispatchInterrupt: OsrDispatchInterruptFn = { taskPtr, msgPtr in
   guard let taskPtr else { return }
   let taskId = String(cString: taskPtr)
   let message = msgPtr.map { String(cString: $0) } ?? ""
@@ -215,7 +239,7 @@ private let mockDispatchInterrupt: osr_dispatch_interrupt_fn = { taskPtr, msgPtr
 
 // MARK: - Mock DB
 
-private let mockDbExec: osr_db_exec_fn = { sqlPtr, paramsPtr in
+private let mockDbExec: OsrDbExecFn = { sqlPtr, paramsPtr in
   guard let sqlPtr else { return nil }
   let sql = String(cString: sqlPtr).trimmingCharacters(in: .whitespacesAndNewlines)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"
@@ -266,15 +290,50 @@ private func mockDbExecLocked(sql: String, paramValues: [Any]) -> UnsafePointer<
     return mockStr("{\"ok\":true}")
   }
 
-  if sql.hasPrefix("INSERT OR IGNORE INTO processed_svix_ids") {
-    if let sid = paramValues.first as? String {
-      mockSvixIds.insert(sid)
+  if sql.hasPrefix("INSERT INTO processed_svix_ids") {
+    if mockFailSvixInserts { return mockChanges(0) }
+    guard let sid = paramValues.first as? String else { return mockChanges(0) }
+    let payload = paramValues[safe: 1] as? String
+    let now = Int(Date().timeIntervalSince1970)
+    if let existing = mockSvixIds[sid] {
+      // Mirrors the ON CONFLICT DO UPDATE ... WHERE clause: only stale
+      // 'processing' claims (lease expired) are re-claimed. COALESCE
+      // preserves the original delivery's payload on takeover with nil.
+      let lease = DatabaseManager.svixClaimLeaseSeconds
+      if existing.status == "processing", existing.createdAt < now - lease {
+        mockSvixIds[sid] = (
+          status: "processing", createdAt: now, payload: payload ?? existing.payload
+        )
+        return mockChanges(1)
+      }
+      return mockChanges(0)
     }
-    return mockStr("{\"ok\":true}")
+    mockSvixIds[sid] = (status: "processing", createdAt: now, payload: payload)
+    return mockChanges(1)
+  }
+
+  if sql.hasPrefix("UPDATE processed_svix_ids SET status = 'completed'") {
+    guard let sid = paramValues.first as? String, let existing = mockSvixIds[sid] else {
+      return mockChanges(0)
+    }
+    // Mirrors `payload = NULL` in the production statement.
+    mockSvixIds[sid] = (status: "completed", createdAt: existing.createdAt, payload: nil)
+    return mockChanges(1)
   }
 
   if sql.hasPrefix("DELETE FROM processed_svix_ids") {
     return mockStr("{\"ok\":true}")
+  }
+
+  if sql.hasPrefix("DELETE FROM messages WHERE email_id = ?1") {
+    guard let eid = paramValues.first as? String,
+      let dir = paramValues[safe: 1] as? String
+    else { return mockChanges(0) }
+    let before = mockMessages.count
+    mockMessages.removeAll {
+      ($0["email_id"] as? String) == eid && ($0["direction"] as? String) == dir
+    }
+    return mockChanges(before - mockMessages.count)
   }
 
   if sql.hasPrefix("INSERT INTO messages") {
@@ -334,7 +393,7 @@ private func mockDbExecLocked(sql: String, paramValues: [Any]) -> UnsafePointer<
   return mockStr("{\"ok\":true}")
 }
 
-private let mockDbQuery: osr_db_query_fn = { sqlPtr, paramsPtr in
+private let mockDbQuery: OsrDbQueryFn = { sqlPtr, paramsPtr in
   guard let sqlPtr else { return nil }
   let sql = String(cString: sqlPtr).trimmingCharacters(in: .whitespacesAndNewlines)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"
@@ -352,12 +411,52 @@ private func mockDbQueryLocked(sql: String, paramValues: [Any]) -> UnsafePointer
     return returnRows([])
   }
 
+  if sql.contains("FROM processed_svix_ids WHERE svix_id = ?1 AND payload IS NOT NULL") {
+    guard let sid = paramValues.first as? String else { return returnRows([[0]]) }
+    let count = mockSvixIds[sid]?.payload != nil ? 1 : 0
+    return returnRows([[count]])
+  }
+
   if sql.contains("FROM processed_svix_ids WHERE svix_id = ?1")
     && sql.contains("SELECT COUNT(*)")
   {
     guard let sid = paramValues.first as? String else { return returnRows([[0]]) }
-    let count = mockSvixIds.contains(sid) ? 1 : 0
+    let count = mockSvixIds[sid] != nil ? 1 : 0
     return returnRows([[count]])
+  }
+
+  if sql.contains("SELECT status FROM processed_svix_ids WHERE svix_id = ?1") {
+    guard let sid = paramValues.first as? String,
+      let entry = mockSvixIds[sid]
+    else { return returnRows([]) }
+    return returnRows([[entry.status]])
+  }
+
+  if sql.contains("SELECT svix_id, payload FROM processed_svix_ids") {
+    // Stale-claim scan: processing + payload + lease expired, oldest first.
+    let lease = DatabaseManager.svixClaimLeaseSeconds
+    let cutoff = Int(Date().timeIntervalSince1970) - lease
+    let limit = paramValues.first as? Int ?? 16
+    let rows: [[Any]] = mockSvixIds
+      .filter { $0.value.status == "processing" && $0.value.payload != nil }
+      .filter { $0.value.createdAt < cutoff }
+      .sorted { $0.value.createdAt < $1.value.createdAt }
+      .prefix(limit)
+      .map { [$0.key, $0.value.payload!] }
+    return returnRows(rows)
+  }
+
+  if sql.contains("SELECT COUNT(*) FROM processed_svix_ids WHERE status = 'processing'") {
+    let count = mockSvixIds.values.filter { $0.status == "processing" }.count
+    return returnRows([[count]])
+  }
+
+  if sql.contains("unixepoch() - MIN(created_at) FROM processed_svix_ids") {
+    let pending = mockSvixIds.values.filter { $0.status == "processing" }
+    guard let oldest = pending.map(\.createdAt).min() else {
+      return returnRows([[NSNull()]])
+    }
+    return returnRows([[Int(Date().timeIntervalSince1970) - oldest]])
   }
 
   if sql.contains("JOIN messages m ON m.thread_id = t.thread_id")
@@ -511,42 +610,48 @@ private func returnRows(_ rows: [[Any]]) -> UnsafePointer<CChar>? {
   return mockStr(str)
 }
 
+// Rows are built with per-element appends: large heterogeneous `[Any]`
+// literals with `??` chains exceed the type-checker budget on CI runners.
+private func columnValue(_ dict: [String: Any], _ key: String, default def: Any = NSNull()) -> Any {
+  dict[key] ?? def
+}
+
 private func returnThreadRows(_ threads: [[String: Any]]) -> UnsafePointer<CChar>? {
   let rows: [[Any]] = threads.map { t in
-    [
-      t["thread_id"] ?? NSNull(),
-      t["subject"] ?? NSNull(),
-      t["participants"] ?? "[]",
-      t["last_message_id"] ?? NSNull(),
-      t["refs"] ?? NSNull(),
-      t["task_id"] ?? NSNull(),
-      t["labels"] ?? "[]",
-      t["created_at"] ?? NSNull(),
-      t["updated_at"] ?? NSNull(),
-    ]
+    var row: [Any] = []
+    row.append(columnValue(t, "thread_id"))
+    row.append(columnValue(t, "subject"))
+    row.append(columnValue(t, "participants", default: "[]"))
+    row.append(columnValue(t, "last_message_id"))
+    row.append(columnValue(t, "refs"))
+    row.append(columnValue(t, "task_id"))
+    row.append(columnValue(t, "labels", default: "[]"))
+    row.append(columnValue(t, "created_at"))
+    row.append(columnValue(t, "updated_at"))
+    return row
   }
   return returnRows(rows)
 }
 
 private func returnMessageRows(_ messages: [[String: Any]]) -> UnsafePointer<CChar>? {
   let rows: [[Any]] = messages.map { m in
-    [
-      m["id"] ?? NSNull(),
-      m["thread_id"] ?? NSNull(),
-      m["email_id"] ?? NSNull(),
-      m["direction"] ?? NSNull(),
-      m["from_address"] ?? NSNull(),
-      m["to_address"] ?? "[]",
-      m["cc_address"] ?? "[]",
-      m["bcc_address"] ?? "[]",
-      m["subject"] ?? NSNull(),
-      m["body_text"] ?? NSNull(),
-      m["body_html"] ?? NSNull(),
-      m["message_id"] ?? NSNull(),
-      m["in_reply_to"] ?? NSNull(),
-      m["has_attachments"] ?? 0,
-      m["created_at"] ?? NSNull(),
-    ]
+    var row: [Any] = []
+    row.append(columnValue(m, "id"))
+    row.append(columnValue(m, "thread_id"))
+    row.append(columnValue(m, "email_id"))
+    row.append(columnValue(m, "direction"))
+    row.append(columnValue(m, "from_address"))
+    row.append(columnValue(m, "to_address", default: "[]"))
+    row.append(columnValue(m, "cc_address", default: "[]"))
+    row.append(columnValue(m, "bcc_address", default: "[]"))
+    row.append(columnValue(m, "subject"))
+    row.append(columnValue(m, "body_text"))
+    row.append(columnValue(m, "body_html"))
+    row.append(columnValue(m, "message_id"))
+    row.append(columnValue(m, "in_reply_to"))
+    row.append(columnValue(m, "has_attachments", default: 0))
+    row.append(columnValue(m, "created_at"))
+    return row
   }
   return returnRows(rows)
 }
@@ -567,4 +672,9 @@ extension Array {
 private func mockStr(_ s: String) -> UnsafePointer<CChar>? {
   guard let ptr = strdup(s) else { return nil }
   return UnsafePointer(ptr)
+}
+
+/// Mirrors the real host's `db_exec` result: `{"changes":N,"last_insert_rowid":N}`.
+private func mockChanges(_ n: Int) -> UnsafePointer<CChar>? {
+  mockStr("{\"changes\":\(n),\"last_insert_rowid\":0}")
 }

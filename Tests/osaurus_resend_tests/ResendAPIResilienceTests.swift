@@ -1,8 +1,10 @@
 import Foundation
+import OsaurusPluginABI
 import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Resend API Resilience", .serialized)
 struct ResendAPIResilienceTests {
 
@@ -82,7 +84,7 @@ struct ResendAPIResilienceTests {
 
     // Find the warning log for the failed request.
     let warning = mockLogMessages.first { entry in
-      entry.0 == 2 && entry.1.contains("HTTP 500")
+      entry.0 == OsrLogLevel.warn && entry.1.contains("HTTP 500")
     }
     #expect(warning != nil)
     if let w = warning {
@@ -99,6 +101,53 @@ struct ResendAPIResilienceTests {
     #expect(ok == true)
     #expect(data?["id"] as? String == "abc")
     #expect(parsedRequests().count == 1)
+  }
+
+  @Test("Retried POST /emails reuses one Idempotency-Key across all attempts")
+  func idempotencyKeyStableAcrossRetries() {
+    MockHost.setUp()
+    MockHost.pushHTTPResponse(status: 429, body: ["message": "rate limited"])
+    MockHost.pushHTTPResponse(status: 502, body: ["message": "bad gateway"])
+    MockHost.pushHTTPResponse(status: 200, body: ["id": "sent-1"])
+
+    let params = SendEmailParams(
+      from: "agent@d.com", to: ["bob@b.com"], subject: "Hi", html: "<p>x</p>",
+      text: nil, cc: nil, bcc: nil, replyTo: nil, headers: nil, attachments: nil)
+    let (emailId, error) = resendSendEmail(apiKey: "re_test", params: params)
+    #expect(emailId == "sent-1")
+    #expect(error == nil)
+
+    let keys = idempotencyKeys()
+    #expect(keys.count == 3, "every attempt must carry an Idempotency-Key")
+    #expect(Set(keys).count == 1, "all attempts must reuse the same key")
+    #expect(!(keys.first ?? "").isEmpty)
+  }
+
+  @Test("Separate logical sends use distinct Idempotency-Keys")
+  func distinctSendsUseDistinctKeys() {
+    MockHost.setUp()
+    MockHost.pushHTTPResponse(status: 200, body: ["id": "s1"])
+    MockHost.pushHTTPResponse(status: 200, body: ["id": "s2"])
+
+    let params = SendEmailParams(
+      from: "agent@d.com", to: ["bob@b.com"], subject: "Hi", html: "<p>x</p>",
+      text: nil, cc: nil, bcc: nil, replyTo: nil, headers: nil, attachments: nil)
+    _ = resendSendEmail(apiKey: "re_test", params: params)
+    _ = resendSendEmail(apiKey: "re_test", params: params)
+
+    let keys = idempotencyKeys()
+    #expect(keys.count == 2)
+    #expect(Set(keys).count == 2, "each logical send gets its own key")
+  }
+
+  private func idempotencyKeys() -> [String] {
+    mockHTTPRequests.compactMap { raw in
+      guard let data = raw.data(using: .utf8),
+        let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let headers = dict["headers"] as? [String: Any]
+      else { return nil }
+      return headers["Idempotency-Key"] as? String
+    }
   }
 
   @Test("Client-side throttle spaces consecutive requests so we don't burst past 5/s")
@@ -122,4 +171,5 @@ struct ResendAPIResilienceTests {
     #expect(elapsedMs >= 200, "throttle should impose ~5*50ms of spacing, got \(elapsedMs)ms")
     #expect(parsedRequests().count == 6)
   }
+}
 }

@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Webhook Reconciliation", .serialized)
 struct WebhookReconcileTests {
 
@@ -341,4 +342,5 @@ struct WebhookReconcileTests {
     #expect(mockConfig["signing_secret"] == nil)
     #expect(mockConfig["webhook_registered"] == nil)
   }
+}
 }

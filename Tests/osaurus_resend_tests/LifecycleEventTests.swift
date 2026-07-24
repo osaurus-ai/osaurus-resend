@@ -3,25 +3,14 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Lifecycle Events", .serialized)
 struct LifecycleEventTests {
 
   // MARK: - Helpers
 
   private func sendWebhook(body: String) -> Int {
-    let routeReq: [String: Any] = [
-      "route_id": "webhook",
-      "method": "POST",
-      "path": "/webhook",
-      "body": body,
-    ]
-    guard let reqJSON = makeJSONString(routeReq) else { return 0 }
-    let result = handleRoute(ctx: PluginContext(), requestJSON: reqJSON)
-    guard let data = result.data(using: .utf8),
-      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-      let status = dict["status"] as? Int
-    else { return 0 }
-    return status
+    SignedWebhook.send(ctx: PluginContext(), body: body).status
   }
 
   private func seedOutboundMessage(threadId: String, emailId: String, taskId: String?) {
@@ -152,14 +141,7 @@ struct LifecycleEventTests {
 
     let body =
       "{\"type\":\"email.received\",\"data\":{\"email_id\":\"dup-e\",\"from\":\"a@a.com\",\"to\":[\"agent@d.com\"]}}"
-    let routeReq: [String: Any] = [
-      "route_id": "webhook",
-      "method": "POST",
-      "path": "/webhook",
-      "body": body,
-      "headers": ["svix-id": "msg_dup_001"],
-    ]
-    guard let reqJSON = makeJSONString(routeReq) else { return }
+    let reqJSON = SignedWebhook.requestJSON(body: body, svixId: "msg_dup_001")
 
     let r1 = handleRoute(ctx: PluginContext(), requestJSON: reqJSON)
     let r2 = handleRoute(ctx: PluginContext(), requestJSON: reqJSON)
@@ -174,4 +156,5 @@ struct LifecycleEventTests {
     #expect(parse(r2) == 200)
     #expect(mockDispatchCalls.count == 1, "Same svix-id must dispatch exactly once")
   }
+}
 }

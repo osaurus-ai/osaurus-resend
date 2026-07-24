@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Reset Webhook Route", .serialized)
 struct ResetWebhookRouteTests {
 
@@ -125,4 +126,5 @@ struct ResetWebhookRouteTests {
     #expect(mockConfig["webhook_id"] == nil)
     #expect(mockConfig["webhook_registered"] == nil)
   }
+}
 }

@@ -3,6 +3,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Webhook & Route Handling", .serialized)
 struct WebhookTests {
 
@@ -322,6 +323,7 @@ struct WebhookTests {
     #expect(parsed.status == 200)
   }
 }
+}
 
 // MARK: - Helpers
 
@@ -340,15 +342,6 @@ private func parseRouteResponse(_ json: String) -> ParsedRouteResponse {
 }
 
 private func sendWebhookRequest(ctx: PluginContext, body: String) -> ParsedRouteResponse {
-  let routeReq: [String: Any] = [
-    "route_id": "webhook",
-    "method": "POST",
-    "path": "/webhook",
-    "body": body,
-  ]
-  guard let reqJSON = makeJSONString(routeReq) else {
-    return ParsedRouteResponse(status: 0, body: "")
-  }
-  let result = handleRoute(ctx: ctx, requestJSON: reqJSON)
+  let result = handleRoute(ctx: ctx, requestJSON: SignedWebhook.requestJSON(body: body))
   return parseRouteResponse(result)
 }

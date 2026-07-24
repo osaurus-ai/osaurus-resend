@@ -4,6 +4,7 @@ import Testing
 
 @testable import osaurus_resend
 
+extension AllResendTests {
 @Suite("Webhook Signature Verification", .serialized)
 struct WebhookSignatureTests {
 
@@ -168,7 +169,8 @@ struct WebhookSignatureTests {
       "method": "POST",
       "path": "/webhook",
       "body": body,
-        // Headers omitted intentionally.
+      // Svix signature headers omitted intentionally.
+      "headers": ["content-type": "application/json"],
     ]
     guard let reqJSON = makeJSONString(routeReq) else {
       #expect(Bool(false), "serialize failed")
@@ -209,6 +211,7 @@ struct WebhookSignatureTests {
       "path": "/webhook",
       "body": body,
       "headers": [
+        "content-type": "application/json",
         "svix-id": svixId,
         "svix-timestamp": ts,
         "svix-signature": signature,
@@ -225,19 +228,15 @@ struct WebhookSignatureTests {
     #expect(mockDispatchCalls.count == 1)
   }
 
-  @Test(
-    "Webhook handler accepts unsigned delivery when no secret is configured (graceful migration)")
-  func handlerAcceptsUnsignedWhenNoSecret() {
+  @Test("Webhook handler fails closed with 503 while no secret is persisted (bootstrap)")
+  func handlerFailsClosedWhenNoSecret() {
     MockHost.setUp()
     DatabaseManager.initSchema()
     mockConfig["sender_policy"] = "open"
     mockConfig["api_key"] = "re_test"
     mockConfig["from_email"] = "agent@d.com"
-    // No signing_secret.
-
-    MockHost.pushReceivedEmailResponse(
-      emailId: "e2", from: "a@a.com", to: ["agent@d.com"],
-      subject: "test", text: "hi", html: nil, messageId: "<msg-2>")
+    // No signing_secret: bootstrap window. Deliveries must NOT be processed;
+    // 503 makes Svix redeliver once registration persists the secret.
 
     let body =
       "{\"type\":\"email.received\",\"data\":{\"email_id\":\"e2\",\"from\":\"a@a.com\",\"to\":[\"agent@d.com\"]}}"
@@ -246,14 +245,18 @@ struct WebhookSignatureTests {
       "method": "POST",
       "path": "/webhook",
       "body": body,
+      "headers": ["content-type": "application/json"],
     ]
     guard let reqJSON = makeJSONString(routeReq) else { return }
 
     let result = handleRoute(ctx: PluginContext(), requestJSON: reqJSON)
     let parsed = parseRouteResponse(result)
-    #expect(parsed.status == 200)
-    #expect(mockDispatchCalls.count == 1)
+    #expect(parsed.status == 503)
+    #expect(mockDispatchCalls.isEmpty, "unverified delivery must not be processed")
+    #expect(mockHTTPRequests.isEmpty)
+    #expect(DatabaseManager.listThreads().isEmpty)
   }
+}
 }
 
 // MARK: - Local helpers (avoid colliding with WebhookTests private helpers)

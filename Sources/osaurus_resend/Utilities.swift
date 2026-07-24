@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OsaurusPluginABI
 
 // MARK: - JSON Helpers
 
@@ -32,21 +33,12 @@ func escapeJSON(_ s: String) -> String {
 
 // MARK: - Host String Ownership
 
-/// Frees a `const char*` returned by any host callback. Host strings are
-/// `strdup`'d; failing to free leaks one allocation per call. v6+ hosts route
-/// through `host->free_string`; older hosts use libc `free` directly, which
-/// is what the host's own implementation does internally.
-///
-/// Never call the plugin's own `free_string` on host pointers — that slot is
-/// the reverse direction (host → plugin) and routing host pointers through it
-/// can corrupt the heap.
+/// Frees a `const char*` returned by any host callback via
+/// `HostBridge.hostFree` (host `free_string` on v6+ hosts, libc `free()`
+/// on older ones). Never call the plugin's own `free_string` on host
+/// pointers — that slot is the reverse direction (host → plugin).
 func freeHostString(_ ptr: UnsafePointer<CChar>?) {
-  guard let ptr else { return }
-  if let f = hostAPI?.pointee.free_string {
-    f(ptr)
-  } else {
-    free(UnsafeMutableRawPointer(mutating: ptr))
-  }
+  HostBridge.shared.hostFree(ptr)
 }
 
 /// Calls a host function that takes one C string and returns a host-allocated
@@ -78,42 +70,41 @@ func callHostString(
 }
 
 // MARK: - Logging
+//
+// Routed through `HostBridge` using the header's canonical `OsrLogLevel`
+// scale (0=trace ... 4=error). The pre-SDK code passed a shifted 0..3
+// scale (debug logged as trace, error logged as warn); Wave 2 fixed the
+// mapping. The bridge also fixes a wave-1 leak: `makeCString` results were
+// passed to `log` and never freed.
 
 func logDebug(_ message: String) {
-  hostAPI?.pointee.log?(0, makeCString(message))
+  HostBridge.shared.log(OsrLogLevel.debug, message)
 }
 
 func logInfo(_ message: String) {
-  hostAPI?.pointee.log?(1, makeCString(message))
+  HostBridge.shared.log(OsrLogLevel.info, message)
 }
 
 func logWarn(_ message: String) {
-  hostAPI?.pointee.log?(2, makeCString(message))
+  HostBridge.shared.log(OsrLogLevel.warn, message)
 }
 
 func logError(_ message: String) {
-  hostAPI?.pointee.log?(3, makeCString(message))
+  HostBridge.shared.log(OsrLogLevel.error, message)
 }
 
 // MARK: - Config
 
 func configGet(_ key: String) -> String? {
-  guard let getValue = hostAPI?.pointee.config_get else { return nil }
-  return callHostString(key, via: getValue)
+  HostBridge.shared.configGet(key)
 }
 
 func configSet(_ key: String, _ value: String) {
-  guard let setValue = hostAPI?.pointee.config_set else { return }
-  key.withCString { k in
-    value.withCString { v in
-      setValue(k, v)
-    }
-  }
+  HostBridge.shared.configSet(key, value)
 }
 
 func configDelete(_ key: String) {
-  guard let deleteValue = hostAPI?.pointee.config_delete else { return }
-  key.withCString { ptr in deleteValue(ptr) }
+  HostBridge.shared.configDelete(key)
 }
 
 // MARK: - Route Helpers
