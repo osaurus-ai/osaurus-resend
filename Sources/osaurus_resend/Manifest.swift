@@ -2,7 +2,7 @@ import Foundation
 
 /// Single source of truth for the plugin version. Embedded in the manifest and
 /// used to derive the outbound `User-Agent`. Must match `osaurus-plugin.json`.
-let resendPluginVersion = "1.3.1"
+let resendPluginVersion = "1.4.0"
 
 /// The plugin manifest, returned verbatim from `get_manifest`. Kept as a
 /// file-scope constant (rather than inline in the C-ABI builder closure) so it
